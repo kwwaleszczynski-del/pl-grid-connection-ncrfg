@@ -1,0 +1,13 @@
+{
+  "v1_exact_pu": 1.0318964520810805,
+  "v1_nr_pu": 1.0318964520810805,
+  "v_abs_error_pu": 0.0,
+  "theta1_exact_rad": 0.07309954422369538,
+  "theta1_nr_rad": 0.07309954422369548,
+  "theta_abs_error_rad": 9.71445146547012e-17,
+  "p_balance_error_mw": 1.2434497875801753e-14,
+  "q_balance_error_mvar": 2.6645352591003757e-15,
+  "p_loss_error_mw": 4.996003610813204e-16,
+  "q_loss_error_mvar": 1.1657341758564144e-15,
+  "nr_iterations": 5
+}

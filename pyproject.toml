@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pl-grid-connection-ncrfg"
+version = "0.1.0"
+description = "Steady-state and N-1 grid connection study of a Polish 110/15 kV substation (GPZ) and radial 15 kV feeders: voltage rise, thermal loading, NC RfG Type B/C Q(U) and cos-phi(P) reactive control, and how export caps or co-located storage unlock hosting capacity."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Konrad Waleszczyński" }]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+grid-ncrfg = "grid_ncrfg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
