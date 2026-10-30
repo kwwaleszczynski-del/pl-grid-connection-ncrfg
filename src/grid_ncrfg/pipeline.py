@@ -10,11 +10,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .network import NetworkModel, build_polish_gpz_network
+from .network import LINE_TYPES, Z_BASE_MV_OHM, NetworkModel, build_polish_gpz_network
 from .powerflow import verify_two_bus_analytical
 from .ncrfg import CONTROL_REGIMES, solve_feeder_with_ncrfg
 from .profiles import generate_annual_polish_profiles
 from .hosting import (
+    GPZ_EXISTING_GEN_MW,
     compute_hosting_capacity_table,
     compute_annual_reactive_loss_comparison,
     compute_curtailment_tradeoff,
@@ -24,6 +25,8 @@ from .hosting import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+HIGHLIGHT_CAP_PCT = 70
+SPATIAL_CAPACITIES_MW = [round(0.5 * k, 1) for k in range(1, 33)]  # 0.5 .. 16.0 MW
 
 
 def _save(fig, path: Path) -> None:
@@ -34,40 +37,28 @@ def _save(fig, path: Path) -> None:
 
 
 def compute_spatial_voltage_profiles(net: NetworkModel) -> dict:
-    """Compute distance-voltage profiles U(x) and branch thermal loadings across F1, F2, F3 for interactive slider."""
-    capacities = list(range(2, 21))  # 2 MW .. 20 MW
+    """Compute distance-voltage profiles U(x) and branch thermal loadings across F1, F2, F3 for the slider."""
     out: dict[str, dict] = {}
     for fcode in ["F1", "F2", "F3"]:
         fspec = net.feeders[fcode]
         bus_ids = [1] + list(fspec.bus_ids)
         br_ids = list(fspec.branch_ids)
+        plant_buses = [fspec.pcc_bus_id, fspec.bus_ids[-2]]
         distances_km = [round(float(net.buses[b].distance_km), 2) for b in bus_ids]
         bus_names = [net.buses[b].name for b in bus_ids]
 
         regimes_data: dict[str, dict[str, dict]] = {}
         for rcode in CONTROL_REGIMES:
             regimes_data[rcode] = {}
-            for p_mw in capacities:
-                res = solve_feeder_with_ncrfg(net, fcode, float(p_mw), rcode)
-                v_prof = [round(float(res.v_mag_pu[b]), 4) for b in bus_ids]
-                max_v = round(float(np.max(res.v_mag_pu[list(fspec.bus_ids)])), 4)
-                max_i_pct = round(float(np.max(res.branch_loading_pct[br_ids])), 1)
-                loss_kw = round(float(np.sum(res.branch_p_loss_mw[br_ids]) * 1000.0), 1)
-                q_pcc = round(
-                    float(
-                        res.q_inj_mvar[fspec.pcc_bus_id]
-                        + res.q_inj_mvar[fspec.bus_ids[-2]]
-                        + net.buses[fspec.pcc_bus_id].q_load_min_mvar
-                        + net.buses[fspec.bus_ids[-2]].q_load_min_mvar
-                    ),
-                    2,
-                )
-                regimes_data[rcode][str(p_mw)] = {
-                    "v_pu": v_prof,
-                    "v_max_pu": max_v,
-                    "max_loading_pct": max_i_pct,
-                    "loss_kw": loss_kw,
-                    "q_mvar": q_pcc,
+            for p_mw in SPATIAL_CAPACITIES_MW:
+                res = solve_feeder_with_ncrfg(net, fcode, p_mw, rcode)
+                q_plant = sum(float(res.q_inj_mvar[b]) + net.buses[b].q_load_min_mvar for b in plant_buses)
+                regimes_data[rcode][f"{p_mw:.1f}"] = {
+                    "v_pu": [round(float(res.v_mag_pu[b]), 4) for b in bus_ids],
+                    "v_max_pu": round(float(np.max(res.v_mag_pu[list(fspec.bus_ids)])), 4),
+                    "max_loading_pct": round(float(np.max(res.branch_loading_pct[br_ids])), 1),
+                    "loss_kw": round(float(np.sum(res.branch_p_loss_mw[br_ids]) * 1000.0), 1),
+                    "q_mvar": round(q_plant, 2),
                 }
         out[fcode] = {
             "name": fspec.name,
@@ -81,15 +72,49 @@ def compute_spatial_voltage_profiles(net: NetworkModel) -> dict:
     return out
 
 
+def describe_network(net: NetworkModel) -> dict:
+    """Line-type data and feeder summaries actually used by the model (for the README and dashboard)."""
+    line_types = [
+        {
+            "code": lt.code,
+            "r_ohm_per_km": round(lt.r_ohm_per_km, 4),
+            "x_ohm_per_km": round(lt.x_ohm_per_km, 4),
+            "b_us_per_km": round(lt.b_us_per_km, 2),
+            "i_dd_a": round(lt.i_dd_a, 0),
+            "s_thermal_mva": round(lt.s_thermal_mva, 2),
+            "rx_ratio": round(lt.rx_ratio, 2),
+        }
+        for lt in LINE_TYPES.values()
+    ]
+    feeders = []
+    for fspec in net.feeders.values():
+        br = [net.branches[k] for k in fspec.branch_ids]
+        feeders.append(
+            {
+                "code": fspec.code,
+                "description": fspec.description,
+                "length_km": fspec.total_length_km,
+                "r_ohm": round(sum(b.r_pu for b in br) * Z_BASE_MV_OHM, 3),
+                "x_ohm": round(sum(b.x_pu for b in br) * Z_BASE_MV_OHM, 3),
+                "rx_ratio": fspec.rx_ratio,
+                "min_load_mw": fspec.p_load_min_mw,
+                "peak_load_mw": fspec.p_load_peak_mw,
+                "weakest_branch_mva": round(min(b.s_max_mva for b in br), 2),
+            }
+        )
+    return {"line_types": line_types, "feeders": feeders}
+
+
 def generate_plots(
     df_hc: pd.DataFrame,
     spatial_profiles: dict,
+    spatial_ref_mw: str,
     week_trace: dict,
     df_curt: pd.DataFrame,
     n1_study: dict,
     img_dir: Path,
 ) -> None:
-    """Generate the 4 README figures in docs/img/*.png using the exact matplotlib style."""
+    """Generate the 4 README figures in docs/img/*.png."""
     img_dir.mkdir(parents=True, exist_ok=True)
     plt.rcdefaults()
     BLUE, NAVY, ORANGE, WARM, GREEN, RED, GREY, INK = (
@@ -107,219 +132,147 @@ def generate_plots(
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.2, 4.1))
     locs = ["F1", "F2", "F3", "GPZ_N1"]
     loc_labels = [
-        "F1 Rural\n(14.2 km)",
-        "F2 Mixed\n(9.6 km)",
-        "F3 Cable\n(6.4 km)",
-        "GPZ 110/15 kV\n(N-1: 25 MVA)",
+        "F1 overhead\n(14.2 km)",
+        "F2 mixed\n(9.6 km)",
+        "F3 cable\n(6.4 km)",
+        "GPZ busbar\n(N-1: 25 MVA)",
     ]
-    regime_Order = [
-        ("uncontrolled", "1. cos phi = 1.0 (firm)", GREY),
-        ("cos_phi_fixed", "2. Fixed cos phi = 0.95 ind", WARM),
-        ("qu_droop", "3. NC RfG Q(U) droop", BLUE),
-        ("non_firm_70", "4. Q(U) + 70 % export cap", GREEN),
-        ("cable_pooling_bess", "5. Q(U) + 2 h BESS pooling", NAVY),
+    regime_order = [
+        ("uncontrolled", "1. cos phi = 1.0", GREY),
+        ("cos_phi_p", "2. cos phi(P), 0.95 ind at Pn", WARM),
+        ("qu_droop", "3. Q(U) droop", BLUE),
     ]
     x = np.arange(len(locs))
-    w = 0.155
-    for i, (rcode, rlabel, col) in enumerate(regime_Order):
+    w = 0.26
+    for i, (rcode, rlabel, col) in enumerate(regime_order):
         vals = [
             float(df_hc[(df_hc["feeder"] == loc) & (df_hc["regime"] == rcode)]["hosting_capacity_mw"].iloc[0])
             for loc in locs
         ]
-        ax1.bar(x + (i - 2) * w, vals, width=w, label=rlabel, color=col)
+        bars = ax1.bar(x + (i - 1) * w, vals, width=w, label=rlabel, color=col)
+        ax1.bar_label(bars, fmt="%.1f", fontsize=6.8, padding=1.5)
     ax1.set_xticks(x, loc_labels, fontsize=8.5)
     ax1.set_ylabel("Connectable capacity [MW]")
-    ax1.set_title("Hosting capacity by feeder and connection regime", fontsize=10)
-    ax1.set_ylim(0, 44.0)
+    ax1.set_title("Hosting capacity by location and reactive control", fontsize=10)
+    ax1.set_ylim(0, 1.15 * float(df_hc["hosting_capacity_mw"].max()))
     ax1.grid(axis="y", alpha=0.25)
     ax1.set_axisbelow(True)
     ax1.legend(loc="upper left", fontsize=7.8, frameon=True)
 
-    # Right panel: Spatial voltage profile along Feeder F1 (0..14.2 km) at 11 MW PV
     f1_sp = spatial_profiles["F1"]
     d_km = f1_sp["distances_km"]
-    p_ref = "11"
-    ax2.plot(
-        d_km,
-        f1_sp["regimes"]["uncontrolled"][p_ref]["v_pu"],
-        marker="o",
-        ms=4,
-        lw=1.3,
-        color=RED,
-        label="cos phi = 1.0 (11 MW -> +8.2 % violation)",
-    )
-    ax2.plot(
-        d_km,
-        f1_sp["regimes"]["cos_phi_fixed"][p_ref]["v_pu"],
-        marker="s",
-        ms=4,
-        lw=1.3,
-        color=WARM,
-        label="Fixed cos phi = 0.95 ind (11 MW)",
-    )
-    ax2.plot(
-        d_km,
-        f1_sp["regimes"]["qu_droop"][p_ref]["v_pu"],
-        marker="^",
-        ms=4,
-        lw=1.4,
-        color=BLUE,
-        label="NC RfG Q(U) droop (11 MW)",
-    )
-    ax2.plot(
-        d_km,
-        f1_sp["regimes"]["non_firm_70"]["16"]["v_pu"],
-        marker="d",
-        ms=4,
-        lw=1.2,
-        ls="--",
-        color=GREEN,
-        label="Q(U) + 70 % cap (16 MW installed)",
-    )
-    ax2.axhline(1.050, color="k", ls="--", lw=0.9, label="DSO PCC limit (+5.0 %, 1.05 pu)")
-    ax2.axhline(1.020, color=GREY, ls=":", lw=0.8, label="Q(U) deadband upper edge (1.02 pu)")
+    styles = {"uncontrolled": ("o", RED), "cos_phi_p": ("s", WARM), "qu_droop": ("^", BLUE)}
+    for rcode, (mk, col) in styles.items():
+        pt = f1_sp["regimes"][rcode][spatial_ref_mw]
+        ax2.plot(d_km, pt["v_pu"], marker=mk, ms=4, lw=1.3, color=col,
+                 label=f"{CONTROL_REGIMES[rcode].short_label}: max {pt['v_max_pu']:.4f} pu")
+    ax2.axhline(1.050, color="k", ls="--", lw=0.9, label="Voltage limit 1.05 pu")
+    ax2.axhline(1.020, color=GREY, ls=":", lw=0.8, label="Q(U) deadband upper edge 1.02 pu")
     ax2.set_xlabel("Distance from GPZ 15 kV busbar [km]")
     ax2.set_ylabel("Node voltage U / Un [pu]")
-    ax2.set_title("Feeder F1 (14.2 km AFL-6): voltage profile along line", fontsize=10)
-    ax2.set_ylim(0.995, 1.112)
+    ax2.set_title(f"Feeder F1 at {float(spatial_ref_mw):.1f} MW: voltage along the line", fontsize=10)
     ax2.grid(alpha=0.25)
     ax2.legend(loc="upper left", fontsize=7.6, frameon=True)
     _save(fig, img_dir / "hosting_capacity.png")
 
-    # 2. Sunny May week time-series on Feeder F1 (step(..., where='post', lw=0.9))
+    # 2. Sunny May week time-series on Feeder F1
     fig, (ax_v, ax_q) = plt.subplots(2, 1, figsize=(10.0, 5.2), sharex=True)
     t_idx = pd.to_datetime(week_trace["timestamps"])
     m_unc = week_trace["modes"]["uncontrolled"]
-    m_fix = week_trace["modes"]["cos_phi_fixed"]
+    m_cos = week_trace["modes"]["cos_phi_p"]
     m_qu = week_trace["modes"]["qu_droop"]
 
-    ax_v.step(t_idx, m_unc["v_pcc_pu"], where="post", lw=0.9, color=RED, label="Uncontrolled (cos phi = 1.0)")
-    ax_v.step(t_idx, m_fix["v_pcc_pu"], where="post", lw=0.9, color=WARM, label="Fixed cos phi = 0.95 ind")
-    ax_v.step(t_idx, m_qu["v_pcc_pu"], where="post", lw=1.0, color=BLUE, label="NC RfG Q(U) droop")
-    ax_v.axhline(1.050, color="k", ls="--", lw=0.8, label="Max PCC voltage (1.050 pu)")
+    ax_v.step(t_idx, m_unc["v_pcc_pu"], where="post", lw=0.9, color=RED, label="cos phi = 1.0")
+    ax_v.step(t_idx, m_cos["v_pcc_pu"], where="post", lw=0.9, color=WARM, label="cos phi(P)")
+    ax_v.step(t_idx, m_qu["v_pcc_pu"], where="post", lw=1.0, color=BLUE, label="Q(U) droop")
+    ax_v.axhline(1.050, color="k", ls="--", lw=0.8, label="Voltage limit 1.05 pu")
     ax_v.axhspan(0.980, 1.020, color=GREY, alpha=0.12, label="Q(U) deadband [0.98, 1.02] pu")
+    v_all = np.concatenate([m_unc["v_pcc_pu"], m_cos["v_pcc_pu"], m_qu["v_pcc_pu"]])
+    ax_v.set_ylim(min(0.975, float(v_all.min()) - 0.005), max(1.055, float(v_all.max())) + 0.03)
     ax_v.set_ylabel("PCC voltage [pu]")
-    ax_v.set_ylim(0.982, 1.122)
     ax_v.set_title(
-        f"Feeder F1 ({week_trace['p_inst_mw']:.1f} MW PV), 18-24 May 2026: PCC voltage and reactive power dispatch",
+        f"Feeder F1 ({week_trace['p_inst_mw']:.2f} MW PV), 18-24 May: PCC voltage and plant reactive power",
         fontsize=10,
     )
     ax_v.grid(alpha=0.25)
     ax_v.legend(loc="upper right", ncol=3, fontsize=7.8, frameon=True)
 
-    ax_q.step(
-        t_idx,
-        m_fix["q_pcc_mvar"],
-        where="post",
-        lw=0.9,
-        color=WARM,
-        label="Q at PCC: Fixed cos phi = 0.95 [Mvar]",
-    )
-    ax_q.step(
-        t_idx,
-        m_qu["q_pcc_mvar"],
-        where="post",
-        lw=1.0,
-        color=BLUE,
-        label="Q at PCC: NC RfG Q(U) droop [Mvar]",
-    )
-    ax_q.step(
-        t_idx,
-        [x / 1000.0 for x in m_qu["loss_kw"]],
-        where="post",
-        lw=0.9,
-        ls="--",
-        color=INK,
-        label="Feeder I^2 R active loss (Q(U)) [MW]",
-    )
+    ax_q.step(t_idx, m_cos["q_pcc_mvar"], where="post", lw=0.9, color=WARM, label="Q plant: cos phi(P) [Mvar]")
+    ax_q.step(t_idx, m_qu["q_pcc_mvar"], where="post", lw=1.0, color=BLUE, label="Q plant: Q(U) [Mvar]")
+    ax_q.step(t_idx, [x / 1000.0 for x in m_qu["loss_kw"]], where="post", lw=0.9, ls="--", color=INK,
+              label="Feeder I^2 R loss, Q(U) [MW]")
     ax_q.axhline(0.0, color="k", lw=0.5)
+    q_min = float(min(np.min(m_cos["q_pcc_mvar"]), np.min(m_qu["q_pcc_mvar"])))
+    q_max = float(max(np.max(m_qu["loss_kw"]) / 1000.0, np.max(m_qu["q_pcc_mvar"]), 0.0))
+    ax_q.set_ylim(q_min - 0.45 * (q_max - q_min), q_max + 0.1 * (q_max - q_min))
     ax_q.set_ylabel("Q [Mvar] / Loss [MW]")
-    ax_q.set_ylim(-4.6, 2.2)
     ax_q.grid(alpha=0.25)
-    ax_q.legend(loc="upper right", ncol=3, fontsize=7.8, frameon=True)
+    ax_q.legend(loc="lower right", ncol=3, fontsize=7.8, frameon=True)
     _save(fig, img_dir / "voltage_qu_profile.png")
 
-    # 3. Non-firm export cap trade-off (50 %..100 % of P_inst)
+    # 3. Export cap trade-off (50 %..100 % of P_inst)
     fig, (ax_c1, ax_c2) = plt.subplots(1, 2, figsize=(9.8, 3.9))
     caps_pct = df_curt["export_cap_pct"].to_numpy()
-    curt_pct = df_curt["curtailed_energy_pct"].to_numpy()
-    bess_pct = df_curt["bess_2h_spilled_pct"].to_numpy()
-    f1_mw = df_curt["f1_connectable_mw"].to_numpy()
-    gpz_mw = df_curt["gpz_n1_connectable_mw"].to_numpy()
+    row_hl = df_curt[df_curt["export_cap_pct"] == HIGHLIGHT_CAP_PCT].iloc[0]
 
-    ax_c1.plot(caps_pct, curt_pct, marker="o", ms=4.5, lw=1.4, color=ORANGE, label="Dynamic curtailment only")
-    ax_c1.plot(
-        caps_pct,
-        bess_pct,
-        marker="s",
-        ms=4.5,
-        lw=1.4,
-        color=BLUE,
-        label="With co-located 2 h BESS (peak-shaving)",
-    )
-    ax_c1.axvline(70, color=GREY, ls="--", lw=0.9, label="70 % export cap (2.4 % curtailed MWh)")
+    ax_c1.plot(caps_pct, df_curt["curtailed_energy_pct"], marker="o", ms=4.5, lw=1.4, color=ORANGE,
+               label="Curtailment only")
+    ax_c1.plot(caps_pct, df_curt["bess_lost_energy_pct"], marker="s", ms=4.5, lw=1.4, color=BLUE,
+               label="With battery (0.35 P_inst, 2 h)")
+    ax_c1.axvline(HIGHLIGHT_CAP_PCT, color=GREY, ls="--", lw=0.9,
+                  label=f"{HIGHLIGHT_CAP_PCT} % cap: {row_hl['curtailed_energy_pct']:.2f} % of MWh")
     ax_c1.set_xlabel("Active power export cap [% of P_inst]")
-    ax_c1.set_ylabel("Annual spilled / curtailed PV energy [% of MWh]")
-    ax_c1.set_title("Non-firm export cap vs annual energy loss", fontsize=10)
+    ax_c1.set_ylabel("Annual PV energy not delivered [% of MWh]")
+    ax_c1.set_title("Export cap vs annual energy loss", fontsize=10)
     ax_c1.set_xlim(102, 48)
-    ax_c1.set_ylim(-0.4, 16.5)
     ax_c1.grid(alpha=0.25)
     ax_c1.legend(loc="upper left", fontsize=8, frameon=True)
 
-    ax_c2.plot(caps_pct, gpz_mw, marker="^", ms=4.5, lw=1.4, color=NAVY, label="GPZ 110/15 kV (N-1: 25 MVA)")
-    ax_c2.plot(caps_pct, f1_mw, marker="o", ms=4.5, lw=1.4, color=GREEN, label="Feeder F1 (with NC RfG Q(U))")
-    ax_c2.axvline(70, color=GREY, ls="--", lw=0.9, label="70 % export cap (+43 % MW)")
+    ax_c2.plot(caps_pct, df_curt["energy_gain_vs_firm_pct"], marker="o", ms=4.5, lw=1.4, color=GREEN,
+               label="Oversized PV, capped")
+    ax_c2.plot(caps_pct, df_curt["bess_energy_gain_vs_firm_pct"], marker="s", ms=4.5, lw=1.4, color=NAVY,
+               label="Oversized PV + battery")
+    ax_c2.plot(caps_pct, 100.0 * (df_curt["installed_per_export_mw"] - 1.0), ls=":", lw=1.1, color=GREY,
+               label="Installed MW gain, 1/cap - 1 (arithmetic)")
+    ax_c2.axvline(HIGHLIGHT_CAP_PCT, color=GREY, ls="--", lw=0.9,
+                  label=f"{HIGHLIGHT_CAP_PCT} % cap: +{row_hl['energy_gain_vs_firm_pct']:.1f} % MWh")
     ax_c2.set_xlabel("Active power export cap [% of P_inst]")
-    ax_c2.set_ylabel("Connectable renewable capacity [MW]")
-    ax_c2.set_title("Unlocked connectable MW vs export cap", fontsize=10)
+    ax_c2.set_ylabel("Gain vs firm plant on same export limit [%]")
+    ax_c2.set_title("Annual energy through a fixed export limit", fontsize=10)
     ax_c2.set_xlim(102, 48)
-    ax_c2.set_ylim(8, 52)
     ax_c2.grid(alpha=0.25)
-    ax_c2.legend(loc="upper left", fontsize=8, frameon=True)
+    ax_c2.legend(loc="upper left", fontsize=7.6, frameon=True)
     _save(fig, img_dir / "curtailment_tradeoff.png")
 
-    # 4. GPZ 110/15 kV transformer loading duration curve & seasonal heatmap under N-0 vs N-1
+    # 4. GPZ 110/15 kV transformer loading duration curve & seasonal heatmap under N-1
     fig, (ax_n1, ax_hm) = plt.subplots(1, 2, figsize=(10.2, 4.0))
     hrs = n1_study["duration_hours"]
-    ax_n1.plot(
-        hrs,
-        n1_study["s_mva_uncontrolled_21p5mw"],
-        lw=1.3,
-        color=GREY,
-        label="21.5 MW PV (firm uncontrolled)",
-    )
-    ax_n1.plot(
-        hrs,
-        n1_study["s_mva_nonfirm_31mw"],
-        lw=1.3,
-        color=GREEN,
-        label="31.0 MW PV (70 % export cap + Q(U))",
-    )
-    ax_n1.plot(
-        hrs,
-        n1_study["s_mva_pooling_bess_36p5mw"],
-        lw=1.5,
-        color=BLUE,
-        label="36.5 MW PV+Wind + 2 h BESS pooling",
-    )
-    ax_n1.axhline(25.0, color=RED, ls="--", lw=1.0, label="N-1 limit: 1x 25 MVA transformer")
+    s_lim = n1_study["s_limit_mva"]
+    ax_n1.plot(hrs, n1_study["s_mva_firm_pv"], lw=1.3, color=GREY,
+               label=f"A: {n1_study['p_firm_mw']:.2f} MW PV, firm")
+    ax_n1.plot(hrs, n1_study["s_mva_capped_pv"], lw=1.3, color=GREEN,
+               label=f"B: {n1_study['capped_pv_mw']:.2f} MW PV, export cap {n1_study['p_firm_mw']:.2f} MW")
+    ax_n1.plot(hrs, n1_study["s_mva_pooling_bess"], lw=1.5, color=BLUE,
+               label=f"C: + {n1_study['pooling_wind_mw']:.2f} MW wind + "
+                     f"{n1_study['pooling_bess_mw']:.2f} MW / {n1_study['pooling_bess_mwh']:.2f} MWh BESS")
+    ax_n1.axhline(s_lim, color=RED, ls="--", lw=1.0, label=f"N-1 limit: 1 x {s_lim:.0f} MVA")
     ax_n1.set_xlabel("Hours per year [h]")
     ax_n1.set_ylabel("GPZ transformer apparent power S [MVA]")
-    ax_n1.set_title("GPZ 110/15 kV loading duration curve (8,760 h)", fontsize=10)
-    ax_n1.set_xlim(0, 8760)
-    ax_n1.set_ylim(0, 36.5)
+    ax_n1.set_title("GPZ 110/15 kV N-1 loading duration curve (8,760 h)", fontsize=10)
+    ax_n1.set_xlim(0, hrs[-1] + 1)
+    ax_n1.set_ylim(0, 1.25 * s_lim)
     ax_n1.grid(alpha=0.25)
-    ax_n1.legend(loc="upper right", fontsize=7.8, frameon=True)
+    ax_n1.legend(loc="upper right", fontsize=7.4, frameon=True)
 
     hm_arr = np.asarray(n1_study["heatmap_p95_mva"], dtype=float)
-    im = ax_hm.imshow(hm_arr, aspect="auto", cmap="YlGnBu", vmin=4.0, vmax=25.0, origin="upper")
+    im = ax_hm.imshow(hm_arr, aspect="auto", cmap="YlGnBu", vmin=0.0, vmax=s_lim, origin="upper")
     cbar = fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
     cbar.set_label("P95 S [MVA]", fontsize=8.5)
     cbar.ax.tick_params(labelsize=8)
     ax_hm.set_yticks(np.arange(12), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], fontsize=8)
     ax_hm.set_xticks([0, 4, 8, 12, 16, 20, 23], ["00", "04", "08", "12", "16", "20", "23"], fontsize=8)
     ax_hm.set_xlabel("Hour of day (Europe/Warsaw)")
-    ax_hm.set_title("Seasonal P95 loading [MVA]: 36.5 MW pooling + BESS", fontsize=10)
+    ax_hm.set_title("Scenario C: monthly P95 transformer loading [MVA]", fontsize=10)
     _save(fig, img_dir / "n1_transformer_loading.png")
 
 
@@ -329,7 +282,7 @@ DASHBOARD_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Grid connection studies and non-firm capacity on Polish MV/110 kV feeders</title>
-<meta name="description" content="Steady-state and N-1 grid connection study of a Polish 110/15 kV substation (GPZ) and radial 15 kV feeders: voltage rise, thermal loading, NC RfG Type B/C Q(U) and cos-phi(P) reactive control, and how export caps or co-located storage unlock hosting capacity.">
+<meta name="description" content="Steady-state and N-1 grid connection study of a synthetic Polish 110/15 kV substation (GPZ) and radial 15 kV feeders: voltage rise, thermal loading, NC RfG cos-phi(P) and Q(U) reactive control, export caps and co-located storage.">
 <style>
 :root {
   color-scheme: light;
@@ -375,8 +328,7 @@ th, td { border-bottom: 1px solid var(--grid); padding: 6px 8px; text-align: lef
 th { color: var(--ink2); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
 td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 .note { font-size: 0.84rem; color: var(--muted); }
-.warn { border-left: 3px solid var(--s2); padding-left: 10px; }
-.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 14px; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr)); gap: 14px; }
 .badge-ok { color: var(--s3); font-weight: 600; }
 .badge-bad { color: var(--bad); font-weight: 600; }
 </style>
@@ -384,40 +336,34 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 <body>
 <main>
 <h1>Grid connection studies and non-firm capacity on Polish MV/110 kV feeders</h1>
-<p>Steady-state and N-1 grid connection study of a Polish 110/15 kV substation (GPZ, two parallel 25 MVA OLTC
-transformers) and four radial 15 kV feeders: how conductor R/X ratio, NC RfG Type B/C autonomous Q(U) and
-cos-phi(P) reactive power control, non-firm active power export caps, and co-located BESS cable pooling govern
-connectable renewable capacity. Code and method:
+<p>Steady-state and N-1 study of a synthetic Polish 110/15 kV substation (GPZ, two 25 MVA OLTC transformers) and
+radial 15 kV feeders built from catalogue AFL-6 and NA2XS(F)2Y data: how feeder impedance, NC RfG cos-phi(P) and
+Q(U) reactive control, active power export caps and a co-located battery change connectable capacity and annual
+energy. Every number on this page is read from the pipeline output. Code and method:
 <a href="https://github.com/kwwaleszczynski-del/pl-grid-connection-ncrfg">github.com/kwwaleszczynski-del/pl-grid-connection-ncrfg</a>.</p>
 
 <div class="tiles" id="kpi-tiles"></div>
 
-<h2>1. Interactive feeder connection &amp; NC RfG simulator</h2>
-<p>Select a 15 kV feeder, an NC RfG reactive / active power control regime, and candidate installed PV capacity
-(2 MW to 20 MW). The left chart shows the exact Newton-Raphson AC voltage profile along the feeder against the
-+5.0 % Polish DSO PCC rise ceiling (1.050 pu); the right chart shows the 7-day sunny May time-series scaled to
-the selected capacity.</p>
+<h2>1. Feeder connection simulator</h2>
+<p>Select a 15 kV feeder, a reactive control regime and a candidate PV capacity. The left chart is the Newton-Raphson
+AC voltage profile along the feeder at minimum load against the 1.05 pu limit (GPZ busbar held at 1.00 pu by the
+OLTC). The right chart is the hourly power flow of the sunny May week on Feeder F1 for the plant size stated in its
+title (it does not change with the slider).</p>
 
 <div class="card">
   <div class="controls">
-    <label>15 kV Feeder
-      <select id="sel-feeder">
-        <option value="F1">F1 Rural Overhead 14.2 km (AFL-6 70/50, R/X = 0.95)</option>
-        <option value="F2">F2 Mixed 9.6 km (NA2XS(F)2Y 150 + AFL-6 70, R/X = 1.10)</option>
-        <option value="F3">F3 Suburban Cable 6.4 km (NA2XS(F)2Y 240, R/X = 0.38)</option>
-      </select>
+    <label>15 kV feeder
+      <select id="sel-feeder"></select>
     </label>
-    <label>Control Mode
+    <label>Control regime
       <select id="sel-regime">
-        <option value="uncontrolled">1. cos phi = 1.0 (uncontrolled firm)</option>
-        <option value="cos_phi_fixed">2. Fixed cos phi = 0.95 ind (above 50 % Pn)</option>
-        <option value="qu_droop" selected>3. NC RfG Q(U) droop (deadband 0.98-1.02 pu)</option>
-        <option value="non_firm_70">4. Q(U) + 70 % Non-Firm Export Cap</option>
-        <option value="cable_pooling_bess">5. Q(U) + 2 h BESS Cable Pooling</option>
+        <option value="uncontrolled">1. cos phi = 1.0</option>
+        <option value="cos_phi_p">2. cos phi(P): 0.95 ind at Pn</option>
+        <option value="qu_droop" selected>3. Q(U) droop (deadband 0.98-1.02 pu)</option>
       </select>
     </label>
-    <label>Candidate Installed PV Capacity: <span id="lbl-mw">11 MW</span>
-      <input type="range" id="rng-mw" min="2" max="20" step="1" value="11">
+    <label>Candidate PV capacity: <span id="lbl-mw"></span>
+      <input type="range" id="rng-mw" min="0" step="1" value="5">
     </label>
   </div>
   <div class="tiles" id="sim-kpis" style="margin: 10px 0 6px;"></div>
@@ -428,29 +374,29 @@ the selected capacity.</p>
   <div class="card"><div id="plot-week" class="plot"></div></div>
 </div>
 
-<h2>2. Hosting capacity across Feeders F1-F3 and GPZ N-1</h2>
-<p>Maximum connectable capacity (MW) satisfying both steady-state PCC voltage rise (U &le; 1.050 pu), continuous
-conductor ampacity (I &le; I_dd), and 110/15 kV transformer N-1 backfeed (S &le; 25.0 MVA).</p>
+<h2>2. Hosting capacity across Feeders F1-F3 and the GPZ busbar under N-1</h2>
+<p>Largest plant (MW) for which bus voltages stay at or below 1.05 pu and every branch within its continuous
+ampacity, at minimum load and full plant output. The GPZ row is new generation at the 15 kV busbar with one
+25 MVA transformer out and existing busbar PV at full output; there the binding limit is the transformer rating.</p>
 <div class="card"><div id="plot-hc" class="plot"></div></div>
 <div class="card scroll" style="margin-top: 12px;"><table id="tbl-hc"></table></div>
 
-<h2>3. Non-firm export cap vs curtailed energy and GPZ N-1 transformer loading</h2>
-<p>Capping peak active export to 70 % of installed MW sacrifices 2.4 % of annual PV generation while unlocking
-+43 % more connectable capacity on both voltage-limited rural feeders and N-1 transformer-limited substations.
-Co-located 2 h BESS cable pooling absorbs midday peaks and cuts spilled energy below 0.6 %.</p>
+<h2>3. Export cap energy trade-off and GPZ N-1 loading over a year</h2>
+<p id="txt-curt"></p>
 <div class="two">
   <div class="card"><div id="plot-curt" class="plot"></div></div>
   <div class="card"><div id="plot-n1" class="plot"></div></div>
 </div>
 
-<h2>4. Solver verification against exact analytical 2-bus solution</h2>
+<h2>4. Solver verification against the closed-form 2-bus solution</h2>
 <p>The polar Newton-Raphson Ybus solver is checked against the closed-form biquadratic 2-bus AC power flow
-solution and exact nodal power conservation.</p>
+solution and nodal power conservation.</p>
 <div class="card scroll"><table id="tbl-ver"></table></div>
 
-<p class="note" style="margin-top: 28px;">Standards &amp; grid code reference: Commission Regulation (EU) 2016/631
-(NC RfG) Type B/C reactive power capability, PN-EN 50160 voltage quality, and Polish DSO (IRiESD / PTPiREE)
-medium-voltage connection evaluation practice. Code: MIT licence.</p>
+<p class="note" style="margin-top: 28px;">Synthetic network and profiles; not a real substation or a DSO assessment.
+Control modes follow NC RfG (Commission Regulation (EU) 2016/631) and EN 50549-2 families; the parameter values and
+the 1.05 pu limit are study assumptions to be verified against the current Polish requirements of general
+application and the DSO IRiESD. Code: MIT licence.</p>
 </main>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <script src="data.js"></script>
@@ -459,6 +405,8 @@ const D = window.DATA;
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const fmt = (x, d = 1) => x == null || isNaN(x) ? "-" : Number(x).toFixed(d);
 const cfg = {responsive: true, displaylogo: false};
+const CAPS = D.spatial_capacities_mw;
+const REG = {uncontrolled: "cos phi = 1.0", cos_phi_p: "cos phi(P)", qu_droop: "Q(U) droop"};
 
 function layoutBase(extra) {
   return Object.assign({
@@ -466,7 +414,7 @@ function layoutBase(extra) {
     font: {family: "system-ui, -apple-system, Segoe UI, sans-serif", color: css("--ink2"), size: 12},
     margin: {l: 56, r: 18, t: 32, b: 48},
     hoverlabel: {bgcolor: css("--surface"), font: {color: css("--ink")}},
-    legend: {orientation: "h", y: 1.12, x: 0, font: {size: 11}}
+    legend: {orientation: "h", y: 1.14, x: 0, font: {size: 11}}
   }, extra);
 }
 const axis = extra => Object.assign({gridcolor: css("--grid"), linecolor: css("--axis"), zeroline: false}, extra);
@@ -474,96 +422,103 @@ const axis = extra => Object.assign({gridcolor: css("--grid"), linecolor: css("-
 function renderHeadlineTiles() {
   const H = D.headline;
   const items = [
-    [`${fmt(H.f1_uncontrolled_mw, 1)} -> ${fmt(H.f1_qu_mw, 1)} MW`, "Feeder F1 (14.2 km) hosting capacity: uncontrolled vs NC RfG Q(U) (+84 %)"],
-    [`-${fmt(H.reactive_loss_reduction_pct, 0)} %`, "Annual reactive I²R line losses on F1: Q(U) deadband vs fixed cos phi = 0.95"],
-    [`${fmt(H.f1_nonfirm70_mw, 1)} MW (${fmt(H.curt_70_pct, 1)} % curt.)`, "Feeder F1 with 70 % non-firm export cap (+43 % MW for 2.4 % MWh)"],
-    [`${fmt(H.gpz_n1_uncontrolled_mw, 1)} -> ${fmt(H.gpz_n1_pooling_bess_mw, 1)} MW`, "GPZ 110/15 kV N-1 (25 MVA) capacity with PV + Wind + 2 h BESS pooling"],
+    [`${fmt(H.f1_uncontrolled_mw, 2)} -> ${fmt(H.f1_qu_mw, 2)} MW`,
+     `Feeder F1 (14.2 km overhead) hosting capacity, cos phi = 1 vs Q(U) (${H.f1_qu_gain_pct >= 0 ? "+" : ""}${fmt(H.f1_qu_gain_pct, 0)} %)`],
+    [`-${fmt(H.q_reduction_pct, 0)} %`,
+     `Annual reactive energy absorbed on F1, Q(U) vs cos phi(P), ${fmt(H.reactive_study_p_mw, 2)} MW plant`],
+    [`${fmt(H.curt_hl_pct, 2)} % of MWh`,
+     `Annual PV energy curtailed by a ${H.highlight_cap_pct} % export cap (+${fmt(H.energy_gain_hl_pct, 1)} % MWh through the same export limit)`],
+    [`${fmt(H.gpz_n1_uncontrolled_mw, 2)} MW`,
+     `GPZ busbar hosting capacity under N-1 (one 25 MVA transformer), cos phi = 1`],
   ];
   document.getElementById("kpi-tiles").innerHTML = items.map(x =>
     `<div class="card tile"><div class="v">${x[0]}</div><div class="l">${x[1]}</div></div>`
   ).join("");
 }
 
+function initControls() {
+  const sel = document.getElementById("sel-feeder");
+  sel.innerHTML = ["F1", "F2", "F3"].map(f =>
+    `<option value="${f}">${D.spatial[f].description} (R/X = ${fmt(D.spatial[f].rx_ratio, 2)})</option>`).join("");
+  const rng = document.getElementById("rng-mw");
+  rng.max = CAPS.length - 1;
+  rng.value = Math.max(0, CAPS.findIndex(c => c >= D.headline.f1_uncontrolled_mw));
+}
+
 function updateInteractiveSim() {
   const fcode = document.getElementById("sel-feeder").value;
   const rcode = document.getElementById("sel-regime").value;
-  const mw = document.getElementById("rng-mw").value;
-  document.getElementById("lbl-mw").textContent = `${mw} MW`;
+  const mw = CAPS[Number(document.getElementById("rng-mw").value)];
+  const key = mw.toFixed(1);
+  document.getElementById("lbl-mw").textContent = `${key} MW`;
 
   const fdata = D.spatial[fcode];
-  const pt = fdata.regimes[rcode][mw];
-  const ptUnc = fdata.regimes["uncontrolled"][mw];
-  const ptQu = fdata.regimes["qu_droop"][mw];
+  const pt = fdata.regimes[rcode][key];
+  const ptUnc = fdata.regimes["uncontrolled"][key];
+  const ptQu = fdata.regimes["qu_droop"][key];
 
   const hcRow = D.hosting_table.find(r => r.feeder === fcode && r.regime === rcode);
   const vOk = pt.v_max_pu <= 1.050;
   const iOk = pt.max_loading_pct <= 100.0;
   const statusHtml = (vOk && iOk)
-    ? `<span class="badge-ok">PASS (Feasible)</span>`
-    : `<span class="badge-bad">VIOLATION (${!vOk ? "Voltage > 1.05 pu" : "Thermal > 100 %"})</span>`;
+    ? `<span class="badge-ok">Within limits</span>`
+    : `<span class="badge-bad">Violation (${!vOk ? "voltage > 1.05 pu" : "thermal > 100 %"})</span>`;
 
   const simTiles = [
-    [statusHtml, `Connection verdict at ${mw} MW (Max connectable in mode: ${fmt(hcRow.hosting_capacity_mw, 1)} MW)`],
-    [`${fmt(pt.v_max_pu, 4)} pu (${fmt((pt.v_max_pu - 1) * 100, 2)} %)`, "Peak PCC voltage U / Un (limit: 1.0500 pu / +5.0 %)"],
-    [`${fmt(pt.max_loading_pct, 1)} %`, "Peak conductor thermal loading I / I_dd (limit: 100 %)"],
-    [`${fmt(pt.q_mvar, 2)} Mvar / ${fmt(pt.loss_kw, 0)} kW`, "Net PCC reactive power Q and feeder active I²R loss"],
+    [statusHtml, `At ${key} MW (hosting capacity in this regime: ${fmt(hcRow.hosting_capacity_mw, 2)} MW)`],
+    [`${fmt(pt.v_max_pu, 4)} pu`, "Highest feeder voltage (limit 1.0500 pu)"],
+    [`${fmt(pt.max_loading_pct, 1)} %`, "Highest branch loading I / I_dd (limit 100 %)"],
+    [`${fmt(pt.q_mvar, 2)} Mvar / ${fmt(pt.loss_kw, 0)} kW`, "Plant reactive power and feeder I²R loss"],
   ];
   document.getElementById("sim-kpis").innerHTML = simTiles.map(x =>
     `<div class="card tile"><div class="v">${x[0]}</div><div class="l">${x[1]}</div></div>`
   ).join("");
 
-  // Plot spatial voltage profile along selected feeder
   const tracesSp = [
     {type: "scatter", mode: "lines+markers", x: fdata.distances_km, y: ptUnc.v_pu,
-     name: "cos phi = 1.0 (uncontrolled)", line: {color: css("--muted"), dash: "dot", width: 2}},
+     name: "cos phi = 1.0", line: {color: css("--muted"), dash: "dot", width: 2}},
     {type: "scatter", mode: "lines+markers", x: fdata.distances_km, y: ptQu.v_pu,
-     name: "NC RfG Q(U) droop", line: {color: css("--s1"), width: 2}},
+     name: "Q(U) droop", line: {color: css("--s1"), width: 2}},
     {type: "scatter", mode: "lines+markers", x: fdata.distances_km, y: pt.v_pu,
-     name: `Selected mode (${mw} MW)`, line: {color: css("--s2"), width: 3}, marker: {size: 8}},
+     name: `Selected: ${REG[rcode]}`, line: {color: css("--s2"), width: 3}, marker: {size: 8}},
   ];
   Plotly.react("plot-spatial", tracesSp, layoutBase({
-    title: {text: `${fdata.name}: voltage profile at ${mw} MW`, font: {size: 13}},
+    title: {text: `${fcode}: voltage profile at ${key} MW`, font: {size: 13}},
     xaxis: axis({title: {text: "Distance from GPZ 15 kV busbar [km]"}}),
-    yaxis: axis({title: {text: "Voltage U / Un [pu]"}, range: [0.99, 1.11]}),
+    yaxis: axis({title: {text: "Voltage U / Un [pu]"}}),
     shapes: [
       {type: "line", xref: "paper", x0: 0, x1: 1, y0: 1.05, y1: 1.05, line: {color: css("--bad"), dash: "dash", width: 1.5}},
       {type: "line", xref: "paper", x0: 0, x1: 1, y0: 1.02, y1: 1.02, line: {color: css("--axis"), dash: "dot", width: 1}}
     ]
   }), cfg);
 
-  // Plot sunny May week trace scaled by selected capacity relative to reference 11.4 MW
   const W = D.week_trace;
-  const scale = Number(mw) / W.p_inst_mw;
-  const vScale = arr => arr.map(v => Number((1.0 + (v - 1.0) * scale).toFixed(4)));
-  const qScale = arr => arr.map(q => Number((q * scale).toFixed(2)));
-
   const tracesWk = [
-    {type: "scatter", mode: "lines", x: W.timestamps, y: vScale(W.modes.uncontrolled.v_pcc_pu),
+    {type: "scatter", mode: "lines", x: W.timestamps, y: W.modes.uncontrolled.v_pcc_pu,
      name: "U_PCC: cos phi = 1.0", line: {color: css("--muted"), width: 1.3, shape: "hv"}},
-    {type: "scatter", mode: "lines", x: W.timestamps, y: vScale(W.modes[rcode].v_pcc_pu),
-     name: "U_PCC: Selected mode", line: {color: css("--s1"), width: 2.0, shape: "hv"}},
-    {type: "scatter", mode: "lines", x: W.timestamps, y: qScale(W.modes[rcode].q_pcc_mvar),
-     name: "Q_PCC [Mvar] (right)", yaxis: "y2", line: {color: css("--s2"), width: 1.5, dash: "dot", shape: "hv"}},
+    {type: "scatter", mode: "lines", x: W.timestamps, y: W.modes[rcode].v_pcc_pu,
+     name: `U_PCC: ${REG[rcode]}`, line: {color: css("--s1"), width: 2.0, shape: "hv"}},
+    {type: "scatter", mode: "lines", x: W.timestamps, y: W.modes[rcode].q_pcc_mvar,
+     name: "Q plant [Mvar] (right)", yaxis: "y2", line: {color: css("--s2"), width: 1.5, dash: "dot", shape: "hv"}},
   ];
   Plotly.react("plot-week", tracesWk, layoutBase({
-    title: {text: `Sunny May week (18-24 May 2026) at ${mw} MW`, font: {size: 13}},
+    title: {text: `F1, ${fmt(W.p_inst_mw, 2)} MW PV, 18-24 May: ${REG[rcode]}`, font: {size: 13}},
     xaxis: axis({type: "date"}),
-    yaxis: axis({title: {text: "PCC Voltage [pu]"}, range: [0.985, 1.11]}),
-    yaxis2: axis({overlaying: "y", side: "right", showgrid: false, title: {text: "Q [Mvar]"}, range: [-6.5, 2.5]}),
+    yaxis: axis({title: {text: "PCC voltage [pu]"}}),
+    yaxis2: axis({overlaying: "y", side: "right", showgrid: false, title: {text: "Q [Mvar]"}}),
     margin: {l: 56, r: 54, t: 32, b: 48},
     shapes: [{type: "line", xref: "paper", x0: 0, x1: 1, y0: 1.05, y1: 1.05, line: {color: css("--bad"), dash: "dash", width: 1.2}}]
   }), cfg);
 }
 
 function renderStaticChartsAndTables() {
+  const H = D.headline;
   const locs = ["F1", "F2", "F3", "GPZ_N1"];
-  const locNames = ["F1 Rural (14.2 km)", "F2 Mixed (9.6 km)", "F3 Cable (6.4 km)", "GPZ 110/15 kV (N-1)"];
+  const locNames = ["F1 overhead (14.2 km)", "F2 mixed (9.6 km)", "F3 cable (6.4 km)", "GPZ busbar (N-1)"];
   const regOrder = [
     ["uncontrolled", "1. cos phi = 1.0", "#898781"],
-    ["cos_phi_fixed", "2. Fixed cos phi = 0.95", "#e8a33d"],
-    ["qu_droop", "3. NC RfG Q(U)", "#2a78d6"],
-    ["non_firm_70", "4. Q(U) + 70 % cap", "#1baf7a"],
-    ["cable_pooling_bess", "5. Q(U) + 2 h BESS", "#1b3f8f"],
+    ["cos_phi_p", "2. cos phi(P)", "#e8a33d"],
+    ["qu_droop", "3. Q(U) droop", "#2a78d6"],
   ];
   const hcBars = regOrder.map(([rc, rl, col]) => ({
     type: "bar", name: rl, x: locNames,
@@ -572,58 +527,63 @@ function renderStaticChartsAndTables() {
   }));
   Plotly.react("plot-hc", hcBars, layoutBase({
     barmode: "group",
-    yaxis: axis({title: {text: "Connectable capacity [MW]"}, range: [0, 42]}),
+    yaxis: axis({title: {text: "Connectable capacity [MW]"}}),
   }), cfg);
 
-  // Hosting capacity table
   const tHc = document.getElementById("tbl-hc");
-  tHc.innerHTML = "<thead><tr><th>Location</th><th>Regime</th><th class='n'>Connectable [MW]</th><th class='n'>Max U_PCC [pu]</th><th class='n'>Max Loading [%]</th><th class='n'>Net Q [Mvar]</th><th class='n'>Loss [kW]</th><th>Binding Constraint</th></tr></thead><tbody>" +
-    D.hosting_table.map(r => `<tr><td>${r.feeder}</td><td>${r.regime}</td><td class='n'>${fmt(r.hosting_capacity_mw, 2)}</td><td class='n'>${fmt(r.v_pcc_pu, 4)}</td><td class='n'>${fmt(r.max_branch_loading_pct, 1)}</td><td class='n'>${fmt(r.q_net_mvar, 2)}</td><td class='n'>${fmt(r.feeder_loss_kw, 1)}</td><td>${r.binding_constraint}</td></tr>`).join("") +
+  tHc.innerHTML = "<thead><tr><th>Location</th><th>Regime</th><th class='n'>Connectable [MW]</th><th class='n'>Max U [pu]</th><th class='n'>Max loading [%]</th><th class='n'>Plant Q [Mvar]</th><th class='n'>Loss [kW]</th><th>Binding constraint</th></tr></thead><tbody>" +
+    D.hosting_table.map(r => `<tr><td>${r.feeder}</td><td>${REG[r.regime]}</td><td class='n'>${fmt(r.hosting_capacity_mw, 2)}</td><td class='n'>${fmt(r.v_pcc_pu, 4)}</td><td class='n'>${fmt(r.max_branch_loading_pct, 1)}</td><td class='n'>${fmt(r.q_net_mvar, 2)}</td><td class='n'>${fmt(r.feeder_loss_kw, 1)}</td><td>${r.binding_constraint}</td></tr>`).join("") +
     "</tbody>";
 
-  // Curtailment trade-off chart
+  const N1 = D.n1_study;
+  document.getElementById("txt-curt").textContent =
+    `A ${H.highlight_cap_pct} % export cap lets ${fmt(1 / (H.highlight_cap_pct / 100), 2)} MW of PV share 1 MW of export limit (arithmetic); ` +
+    `over the synthetic year it curtails ${fmt(H.curt_hl_pct, 2)} % of that PV energy and delivers ` +
+    `${fmt(H.energy_gain_hl_pct, 1)} % more MWh through the same limit than a firm plant. ` +
+    `Right: hourly N-1 power flow of the GPZ for the firm, capped and pooled (PV + wind + battery) busbar scenarios; ` +
+    `highest transformer loading ${fmt(N1.max_s_firm_pv_mva, 2)} / ${fmt(N1.max_s_capped_pv_mva, 2)} / ${fmt(N1.max_s_pooling_bess_mva, 2)} MVA ` +
+    `against ${fmt(N1.s_limit_mva, 0)} MVA.`;
+
   const C = D.curtailment;
   Plotly.react("plot-curt", [
     {type: "scatter", mode: "lines+markers", x: C.map(r => r.export_cap_pct), y: C.map(r => r.curtailed_energy_pct),
      name: "Curtailed PV energy [%]", line: {color: css("--s2"), width: 2}},
-    {type: "scatter", mode: "lines+markers", x: C.map(r => r.export_cap_pct), y: C.map(r => r.bess_2h_spilled_pct),
-     name: "Spilled with 2 h BESS [%]", line: {color: css("--s3"), width: 2}},
-    {type: "scatter", mode: "lines+markers", x: C.map(r => r.export_cap_pct), y: C.map(r => r.gpz_n1_connectable_mw),
-     name: "GPZ N-1 Connectable [MW] (right)", yaxis: "y2", line: {color: css("--s1"), width: 2, dash: "dash"}},
+    {type: "scatter", mode: "lines+markers", x: C.map(r => r.export_cap_pct), y: C.map(r => r.bess_lost_energy_pct),
+     name: "Not delivered with battery [%]", line: {color: css("--s3"), width: 2}},
+    {type: "scatter", mode: "lines+markers", x: C.map(r => r.export_cap_pct), y: C.map(r => r.energy_gain_vs_firm_pct),
+     name: "MWh gain vs firm [%] (right)", yaxis: "y2", line: {color: css("--s1"), width: 2, dash: "dash"}},
   ], layoutBase({
-    title: {text: "Export cap vs curtailed energy & connectable MW", font: {size: 13}},
+    title: {text: "Export cap vs energy", font: {size: 13}},
     xaxis: axis({title: {text: "Export cap [% of P_inst]"}, autorange: "reversed"}),
-    yaxis: axis({title: {text: "Curtailed energy [% of MWh]"}, range: [0, 16]}),
-    yaxis2: axis({overlaying: "y", side: "right", showgrid: false, title: {text: "GPZ N-1 MW"}, range: [15, 48]}),
+    yaxis: axis({title: {text: "Energy not delivered [% of MWh]"}}),
+    yaxis2: axis({overlaying: "y", side: "right", showgrid: false, title: {text: "MWh gain [%]"}}),
     margin: {l: 56, r: 54, t: 32, b: 48}
   }), cfg);
 
-  // N-1 transformer loading duration curve
-  const N1 = D.n1_study;
   Plotly.react("plot-n1", [
-    {type: "scatter", mode: "lines", x: N1.duration_hours, y: N1.s_mva_uncontrolled_21p5mw,
-     name: "21.5 MW PV (firm)", line: {color: css("--muted"), width: 2}},
-    {type: "scatter", mode: "lines", x: N1.duration_hours, y: N1.s_mva_nonfirm_31mw,
-     name: "31.0 MW PV (70 % cap)", line: {color: css("--s3"), width: 2}},
-    {type: "scatter", mode: "lines", x: N1.duration_hours, y: N1.s_mva_pooling_bess_36p5mw,
-     name: "36.5 MW PV+Wind + BESS", line: {color: css("--s1"), width: 2.2}},
+    {type: "scatter", mode: "lines", x: N1.duration_hours, y: N1.s_mva_firm_pv,
+     name: `A: ${fmt(N1.p_firm_mw, 2)} MW PV firm`, line: {color: css("--muted"), width: 2}},
+    {type: "scatter", mode: "lines", x: N1.duration_hours, y: N1.s_mva_capped_pv,
+     name: `B: ${fmt(N1.capped_pv_mw, 2)} MW PV capped`, line: {color: css("--s3"), width: 2}},
+    {type: "scatter", mode: "lines", x: N1.duration_hours, y: N1.s_mva_pooling_bess,
+     name: `C: + ${fmt(N1.pooling_wind_mw, 2)} MW wind + BESS`, line: {color: css("--s1"), width: 2.2}},
   ], layoutBase({
-    title: {text: "GPZ 110/15 kV transformer S [MVA] duration curve", font: {size: 13}},
+    title: {text: "GPZ transformer S [MVA] under N-1, duration curve", font: {size: 13}},
     xaxis: axis({title: {text: "Hours per year [h]"}}),
-    yaxis: axis({title: {text: "Apparent power S [MVA]"}, range: [0, 30]}),
-    shapes: [{type: "line", xref: "paper", x0: 0, x1: 1, y0: 25.0, y1: 25.0, line: {color: css("--bad"), dash: "dash", width: 1.5}}]
+    yaxis: axis({title: {text: "Apparent power S [MVA]"}, range: [0, 1.25 * N1.s_limit_mva]}),
+    shapes: [{type: "line", xref: "paper", x0: 0, x1: 1, y0: N1.s_limit_mva, y1: N1.s_limit_mva, line: {color: css("--bad"), dash: "dash", width: 1.5}}]
   }), cfg);
 
-  // Verification table
   const V = D.verification;
   const vRows = [
-    ["2-bus PCC voltage magnitude |V1| [pu]", V.v1_exact_pu.toFixed(10), V.v1_nr_pu.toFixed(10), V.v_abs_error_pu.toExponential(2)],
-    ["2-bus PCC voltage angle theta1 [rad]", V.theta1_exact_rad.toFixed(10), V.theta1_nr_rad.toFixed(10), V.theta_abs_error_rad.toExponential(2)],
-    ["Active power balance (P_slack + P_gen - P_load - P_loss) [MW]", "0.0000000000", V.p_balance_error_mw.toExponential(2), V.p_balance_error_mw.toExponential(2)],
-    ["Reactive power balance (Q_slack + Q_gen - Q_load - Q_loss) [Mvar]", "0.0000000000", V.q_balance_error_mvar.toExponential(2), V.q_balance_error_mvar.toExponential(2)],
+    ["2-bus receiving-end voltage |V1| [pu]", V.v1_exact_pu.toFixed(10), V.v1_nr_pu.toFixed(10), V.v_abs_error_pu.toExponential(2)],
+    ["2-bus receiving-end angle theta1 [rad]", V.theta1_exact_rad.toFixed(10), V.theta1_nr_rad.toFixed(10), V.theta_abs_error_rad.toExponential(2)],
+    ["Series loss I²R [MW]", V.p_loss_exact_mw.toFixed(10), V.p_loss_nr_mw.toFixed(10), V.p_loss_error_mw.toExponential(2)],
+    ["Active power balance [MW]", "0", V.p_balance_error_mw.toExponential(2), V.p_balance_error_mw.toExponential(2)],
+    ["Reactive power balance [Mvar]", "0", V.q_balance_error_mvar.toExponential(2), V.q_balance_error_mvar.toExponential(2)],
   ];
   document.getElementById("tbl-ver").innerHTML =
-    "<thead><tr><th>Verification Quantity</th><th class='n'>Analytical Exact</th><th class='n'>Newton-Raphson Ybus</th><th class='n'>Absolute Error</th></tr></thead><tbody>" +
+    "<thead><tr><th>Quantity</th><th class='n'>Closed form</th><th class='n'>Newton-Raphson Ybus</th><th class='n'>Absolute error</th></tr></thead><tbody>" +
     vRows.map(r => `<tr><td>${r[0]}</td><td class='n'>${r[1]}</td><td class='n'>${r[2]}</td><td class='n'>${r[3]}</td></tr>`).join("") +
     "</tbody>";
 }
@@ -634,6 +594,7 @@ function renderAll() {
   renderStaticChartsAndTables();
 }
 
+initControls();
 document.getElementById("sel-feeder").addEventListener("change", updateInteractiveSim);
 document.getElementById("sel-regime").addEventListener("change", updateInteractiveSim);
 document.getElementById("rng-mw").addEventListener("input", updateInteractiveSim);
@@ -673,62 +634,75 @@ def run_full_pipeline(output_root: Path | None = None) -> dict:
     df_hc = compute_hosting_capacity_table(net_n1)
     df_hc.to_csv(results_dir / "hosting_capacity.csv", index=False)
 
-    f1_qu_mw = float(df_hc[(df_hc["feeder"] == "F1") & (df_hc["regime"] == "qu_droop")]["hosting_capacity_mw"].iloc[0])
-    gpz_qu_mw = float(
-        df_hc[(df_hc["feeder"] == "GPZ_N1") & (df_hc["regime"] == "qu_droop")]["hosting_capacity_mw"].iloc[0]
-    )
-
-    df_curt = compute_curtailment_tradeoff(df_profiles, f1_firm_qu_mw=f1_qu_mw, gpz_firm_qu_mw=gpz_qu_mw)
-    df_curt.to_csv(results_dir / "curtailment_tradeoff.csv", index=False)
-
-    loss_cmp = compute_annual_reactive_loss_comparison(net_n0, df_profiles, feeder_code="F1", p_inst_mw=6.2)
-    n1_study = compute_n1_transformer_study(df_profiles)
-    week_trace = simulate_sunny_week_trace(net_n0, df_profiles, feeder_code="F1", p_inst_mw=11.4)
-    spatial_profiles = compute_spatial_voltage_profiles(net_n1)
-    ver = verify_two_bus_analytical()
-
-    (results_dir / "verification.json").write_text(json.dumps(ver, indent=2), encoding="utf-8")
-
     def _hc_val(f: str, r: str) -> float:
         return float(df_hc[(df_hc["feeder"] == f) & (df_hc["regime"] == r)]["hosting_capacity_mw"].iloc[0])
 
-    curt_70_row = df_curt[df_curt["export_cap_pct"] == 70].iloc[0]
+    df_curt = compute_curtailment_tradeoff(df_profiles)
+    df_curt.to_csv(results_dir / "curtailment_tradeoff.csv", index=False)
+
+    # Reactive study plant: the F1 unity-power-factor hosting capacity, feasible under all three regimes
+    loss_cmp = compute_annual_reactive_loss_comparison(
+        net_n0, df_profiles, feeder_code="F1", p_inst_mw=_hc_val("F1", "uncontrolled")
+    )
+    n1_study = compute_n1_transformer_study(
+        net_n1, df_profiles, p_firm_mw=_hc_val("GPZ_N1", "uncontrolled"), export_cap_share=HIGHLIGHT_CAP_PCT / 100.0
+    )
+    week_trace = simulate_sunny_week_trace(net_n0, df_profiles, feeder_code="F1", p_inst_mw=_hc_val("F1", "qu_droop"))
+    spatial_profiles = compute_spatial_voltage_profiles(net_n1)
+    ver = verify_two_bus_analytical()
+    (results_dir / "verification.json").write_text(json.dumps(ver, indent=2), encoding="utf-8")
+
+    # Figure 1 right panel: largest slider capacity not above the F1 Q(U) hosting capacity
+    spatial_ref_mw = f"{max(c for c in SPATIAL_CAPACITIES_MW if c <= _hc_val('F1', 'qu_droop')):.1f}"
+
+    row_hl = df_curt[df_curt["export_cap_pct"] == HIGHLIGHT_CAP_PCT].iloc[0]
     headline = {
         "f1_uncontrolled_mw": _hc_val("F1", "uncontrolled"),
-        "f1_cosphi_mw": _hc_val("F1", "cos_phi_fixed"),
+        "f1_cosphi_mw": _hc_val("F1", "cos_phi_p"),
         "f1_qu_mw": _hc_val("F1", "qu_droop"),
-        "f1_nonfirm70_mw": _hc_val("F1", "non_firm_70"),
-        "f1_pooling_bess_mw": _hc_val("F1", "cable_pooling_bess"),
         "f2_uncontrolled_mw": _hc_val("F2", "uncontrolled"),
-        "f2_cosphi_mw": _hc_val("F2", "cos_phi_fixed"),
+        "f2_cosphi_mw": _hc_val("F2", "cos_phi_p"),
         "f2_qu_mw": _hc_val("F2", "qu_droop"),
-        "f2_nonfirm70_mw": _hc_val("F2", "non_firm_70"),
         "f3_uncontrolled_mw": _hc_val("F3", "uncontrolled"),
-        "f3_cosphi_mw": _hc_val("F3", "cos_phi_fixed"),
+        "f3_cosphi_mw": _hc_val("F3", "cos_phi_p"),
         "f3_qu_mw": _hc_val("F3", "qu_droop"),
-        "f3_nonfirm70_mw": _hc_val("F3", "non_firm_70"),
         "gpz_n1_uncontrolled_mw": _hc_val("GPZ_N1", "uncontrolled"),
-        "gpz_n1_cosphi_mw": _hc_val("GPZ_N1", "cos_phi_fixed"),
+        "gpz_n1_cosphi_mw": _hc_val("GPZ_N1", "cos_phi_p"),
         "gpz_n1_qu_mw": _hc_val("GPZ_N1", "qu_droop"),
-        "gpz_n1_nonfirm70_mw": _hc_val("GPZ_N1", "non_firm_70"),
-        "gpz_n1_pooling_bess_mw": _hc_val("GPZ_N1", "cable_pooling_bess"),
-        "reactive_loss_reduction_pct": loss_cmp["reactive_loss_reduction_pct"],
-        "curt_70_pct": float(curt_70_row["curtailed_energy_pct"]),
-        "pooling_spilled_pct": n1_study["pooling_spilled_energy_pct"],
+        "f1_qu_gain_pct": round(100.0 * (_hc_val("F1", "qu_droop") / _hc_val("F1", "uncontrolled") - 1.0), 1),
+        "f1_cosphi_gain_pct": round(100.0 * (_hc_val("F1", "cos_phi_p") / _hc_val("F1", "uncontrolled") - 1.0), 1),
+        "f3_cosphi_change_pct": round(100.0 * (_hc_val("F3", "cos_phi_p") / _hc_val("F3", "uncontrolled") - 1.0), 1),
+        "f3_qu_change_pct": round(100.0 * (_hc_val("F3", "qu_droop") / _hc_val("F3", "uncontrolled") - 1.0), 1),
+        "reactive_study_p_mw": loss_cmp["p_inst_mw"],
+        "q_reduction_pct": loss_cmp["q_reduction_pct"],
+        "extra_loss_reduction_pct": loss_cmp["extra_loss_reduction_pct"],
+        "highlight_cap_pct": HIGHLIGHT_CAP_PCT,
+        "curt_hl_pct": float(row_hl["curtailed_energy_pct"]),
+        "curt_hl_hours": int(row_hl["curtailed_hours_per_yr"]),
+        "energy_gain_hl_pct": float(row_hl["energy_gain_vs_firm_pct"]),
+        "bess_lost_hl_pct": float(row_hl["bess_lost_energy_pct"]),
+        "pooling_spilled_nobess_pct": n1_study["pooling_spilled_nobess_pct"],
+        "pooling_lost_bess_pct": n1_study["pooling_lost_bess_pct"],
+        "pv_flh": round(float(df_profiles["pv_cf"].sum()), 1),
+        "pv_peak_pu": round(float(df_profiles["pv_cf"].max()), 3),
+        "wind_flh": round(float(df_profiles["wind_cf"].sum()), 1),
+        "gpz_existing_gen_mw": GPZ_EXISTING_GEN_MW,
     }
 
     summary_payload = {
         "headline": headline,
+        "network": describe_network(net_n1),
         "hosting_table": df_hc.to_dict(orient="records"),
         "curtailment": df_curt.to_dict(orient="records"),
         "reactive_loss_comparison": loss_cmp,
         "n1_study": n1_study,
         "week_trace": week_trace,
+        "spatial_capacities_mw": SPATIAL_CAPACITIES_MW,
         "spatial": spatial_profiles,
         "verification": ver,
     }
     (results_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
 
-    generate_plots(df_hc, spatial_profiles, week_trace, df_curt, n1_study, img_dir)
+    generate_plots(df_hc, spatial_profiles, spatial_ref_mw, week_trace, df_curt, n1_study, img_dir)
     generate_dashboard_html(summary_payload, docs_dir)
     return summary_payload

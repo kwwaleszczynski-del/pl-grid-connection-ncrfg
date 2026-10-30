@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 import numpy as np
 
 from .network import BASE_MVA, BASE_KV_MV, NetworkModel, build_Ybus
@@ -34,6 +35,10 @@ class PowerFlowResult:
     tr_loading_n0_pct: float
     tr_loading_n1_pct: float
     oltc_tap_ratio: float
+    q_v_mvar: np.ndarray
+
+
+QOfV = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
 def solve_ac_powerflow(
@@ -46,6 +51,8 @@ def solve_ac_powerflow(
     regulate_gpz_15kv: bool = True,
     tol: float = 1e-11,
     max_iter: int = 30,
+    q_of_v_buses: np.ndarray | None = None,
+    q_of_v: QOfV | None = None,
 ) -> PowerFlowResult:
     """Solve exact polar Newton-Raphson AC power flow using Ybus.
 
@@ -67,6 +74,11 @@ def solve_ac_powerflow(
         Convergence tolerance on maximum P and Q mismatch in per-unit on BASE_MVA.
     max_iter : int
         Maximum Newton-Raphson iterations.
+    q_of_v_buses, q_of_v : optional
+        Voltage-dependent reactive injection (e.g. a Q(U) droop) at the listed buses:
+        q_of_v(v_pu) returns (Q [Mvar], dQ/dV [Mvar/pu]) for those buses. It is added to
+        q_gen_mvar inside the Newton iteration (its slope enters the Jacobian), so the
+        controller equilibrium is solved together with the power flow.
     """
     n = len(net.buses)
     p_g = np.zeros(n, dtype=float) if p_gen_mw is None else np.asarray(p_gen_mw, dtype=float)
@@ -86,15 +98,23 @@ def solve_ac_powerflow(
     q_spec_pu = (q_g - q_l) / BASE_MVA
 
     slack_idx = 0
-    pq_idx = np.arange(1, n, dtype=int)
-    n_pq = len(pq_idx)
+    # All non-slack buses are PQ buses (indices 1..n-1), so the PQ sub-blocks are plain slices
+    n_pq = n - 1
+    qv_idx = np.asarray(q_of_v_buses, dtype=int) if (q_of_v is not None and q_of_v_buses is not None) else None
+
+    def _q_of_v_pu(v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        q_mvar, dq_dv_mvar = q_of_v(v[qv_idx])
+        return np.asarray(q_mvar, dtype=float) / BASE_MVA, np.asarray(dq_dv_mvar, dtype=float) / BASE_MVA
 
     def _run_nr(Ybus: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool, int, float]:
         G = Ybus.real
         B = Ybus.imag
+        diag_G = np.diag(G)
+        diag_B = np.diag(B)
         v = np.ones(n, dtype=float)
         v[slack_idx] = v_slack_pu
         theta = np.zeros(n, dtype=float)
+        J = np.empty((2 * n_pq, 2 * n_pq), dtype=float)
 
         converged = False
         max_mis = 0.0
@@ -109,9 +129,13 @@ def solve_ac_powerflow(
             p_calc = v * (Gcos_Bsin @ v)
             q_calc = v * (Gsin_Bcos @ v)
 
-            dp = p_spec_pu[pq_idx] - p_calc[pq_idx]
-            dq = q_spec_pu[pq_idx] - q_calc[pq_idx]
-            mismatch = np.concatenate([dp, dq])
+            q_spec_it = q_spec_pu
+            if qv_idx is not None:
+                q_v_pu, dq_dv_pu = _q_of_v_pu(v)
+                q_spec_it = q_spec_pu.copy()
+                q_spec_it[qv_idx] += q_v_pu
+
+            mismatch = np.concatenate([p_spec_pu[1:] - p_calc[1:], q_spec_it[1:] - q_calc[1:]])
             max_mis = float(np.max(np.abs(mismatch)))
             if max_mis < tol:
                 converged = True
@@ -120,27 +144,29 @@ def solve_ac_powerflow(
             # Analytical Polar Jacobian J = [[H, N], [M, L]]
             vv = np.outer(v, v)
             H = vv * Gsin_Bcos
-            np.fill_diagonal(H, -q_calc - (v ** 2) * np.diag(B))
+            np.fill_diagonal(H, -q_calc - (v ** 2) * diag_B)
 
             N = (v[:, None] * Gcos_Bsin)
-            np.fill_diagonal(N, p_calc / v + v * np.diag(G))
+            np.fill_diagonal(N, p_calc / v + v * diag_G)
 
             M = -vv * Gcos_Bsin
-            np.fill_diagonal(M, p_calc - (v ** 2) * np.diag(G))
+            np.fill_diagonal(M, p_calc - (v ** 2) * diag_G)
 
             L = (v[:, None] * Gsin_Bcos)
-            np.fill_diagonal(L, q_calc / v - v * np.diag(B))
+            np.fill_diagonal(L, q_calc / v - v * diag_B)
+            if qv_idx is not None:
+                # Specified Q depends on V: d(Q_calc - Q_spec)/dV adds -dQ_spec/dV on the diagonal
+                L[qv_idx, qv_idx] -= dq_dv_pu
 
-            J11 = H[np.ix_(pq_idx, pq_idx)]
-            J12 = N[np.ix_(pq_idx, pq_idx)]
-            J21 = M[np.ix_(pq_idx, pq_idx)]
-            J22 = L[np.ix_(pq_idx, pq_idx)]
-            J = np.block([[J11, J12], [J21, J22]])
+            J[:n_pq, :n_pq] = H[1:, 1:]
+            J[:n_pq, n_pq:] = N[1:, 1:]
+            J[n_pq:, :n_pq] = M[1:, 1:]
+            J[n_pq:, n_pq:] = L[1:, 1:]
 
             dx = np.linalg.solve(J, mismatch)
-            theta[pq_idx] += dx[:n_pq]
-            v[pq_idx] += dx[n_pq:]
-            v[pq_idx] = np.clip(v[pq_idx], 0.5, 1.5)
+            theta[1:] += dx[:n_pq]
+            v[1:] += dx[n_pq:]
+            v[1:] = np.clip(v[1:], 0.5, 1.5)
 
         return v, theta, converged, it, max_mis
 
@@ -148,11 +174,15 @@ def solve_ac_powerflow(
     Ybus = build_Ybus(net, tap_override=tap)
     v, theta, converged, it, max_mis = _run_nr(Ybus)
 
-    if regulate_gpz_15kv and n > 1 and abs(v[1] - net.substation.v_target_mv_pu) > 2e-4:
-        # Adjust off-nominal OLTC tap ratio so GPZ 15 kV busbar regulates to v_target_mv_pu
-        tap = float(np.clip(tap * (v[1] / net.substation.v_target_mv_pu), 1.0 - 0.1602, 1.0 + 0.1602))
-        Ybus = build_Ybus(net, tap_override=tap)
-        v, theta, converged, it, max_mis = _run_nr(Ybus)
+    if regulate_gpz_15kv and n > 1:
+        # Continuous OLTC model: rescale the off-nominal tap ratio until the GPZ 15 kV busbar sits at
+        # v_target_mv_pu (two corrections bring it within ~1e-6 pu; tap range +-9 x 1.78 %)
+        for _ in range(3):
+            if abs(v[1] - net.substation.v_target_mv_pu) <= 1e-5:
+                break
+            tap = float(np.clip(tap * (v[1] / net.substation.v_target_mv_pu), 1.0 - 0.1602, 1.0 + 0.1602))
+            Ybus = build_Ybus(net, tap_override=tap)
+            v, theta, converged, it, max_mis = _run_nr(Ybus)
 
     v_complex = v * np.exp(1j * theta)
     i_inj_pu = Ybus @ v_complex
@@ -205,6 +235,10 @@ def solve_ac_powerflow(
     tr_n0_pct = 100.0 * tr_s_mva / net.substation.s_n0_mva
     tr_n1_pct = 100.0 * tr_s_mva / net.substation.s_n1_mva
 
+    q_v_mvar = np.zeros(n, dtype=float)
+    if qv_idx is not None:
+        q_v_mvar[qv_idx] = np.asarray(q_of_v(v[qv_idx])[0], dtype=float)
+
     return PowerFlowResult(
         converged=converged,
         iterations=it,
@@ -228,6 +262,7 @@ def solve_ac_powerflow(
         tr_loading_n0_pct=tr_n0_pct,
         tr_loading_n1_pct=tr_n1_pct,
         oltc_tap_ratio=tap,
+        q_v_mvar=q_v_mvar,
     )
 
 
@@ -308,6 +343,11 @@ def verify_two_bus_analytical() -> dict[str, float]:
     qloss_err = float(abs(res.branch_q_loss_mvar[0] - qloss_exact_pu * BASE_MVA))
 
     return {
+        "r_pu": r_pu,
+        "x_pu": x_pu,
+        "p1_mw": p1_mw,
+        "q1_mvar": q1_mvar,
+        "v0_pu": v0_pu,
         "v1_exact_pu": v1_exact,
         "v1_nr_pu": float(res.v_mag_pu[1]),
         "v_abs_error_pu": v_err,
@@ -316,6 +356,8 @@ def verify_two_bus_analytical() -> dict[str, float]:
         "theta_abs_error_rad": th_err,
         "p_balance_error_mw": p_bal_err,
         "q_balance_error_mvar": q_bal_err,
+        "p_loss_exact_mw": ploss_exact_pu * BASE_MVA,
+        "p_loss_nr_mw": float(res.branch_p_loss_mw[0]),
         "p_loss_error_mw": ploss_err,
         "q_loss_error_mvar": qloss_err,
         "nr_iterations": int(res.iterations),

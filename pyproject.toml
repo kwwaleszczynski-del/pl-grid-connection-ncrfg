@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pl-grid-connection-ncrfg"
 version = "0.1.0"
-description = "Steady-state and N-1 grid connection study of a Polish 110/15 kV substation (GPZ) and radial 15 kV feeders: voltage rise, thermal loading, NC RfG Type B/C Q(U) and cos-phi(P) reactive control, and how export caps or co-located storage unlock hosting capacity."
+description = "Steady-state and N-1 grid connection study of a synthetic Polish 110/15 kV substation (GPZ) and radial 15 kV feeders: voltage rise, thermal loading, NC RfG cos-phi(P) and Q(U) reactive control, and the energy cost of export caps, co-located storage and cable pooling."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

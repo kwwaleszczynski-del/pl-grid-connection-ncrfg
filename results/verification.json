@@ -1,4 +1,9 @@
 {
+  "r_pu": 0.088,
+  "x_pu": 0.0926,
+  "p1_mw": 6.2,
+  "q1_mvar": -2.04,
+  "v0_pu": 1.0,
   "v1_exact_pu": 1.0318964520810805,
   "v1_nr_pu": 1.0318964520810805,
   "v_abs_error_pu": 0.0,
@@ -7,6 +12,8 @@
   "theta_abs_error_rad": 9.71445146547012e-17,
   "p_balance_error_mw": 1.2434497875801753e-14,
   "q_balance_error_mvar": 2.6645352591003757e-15,
+  "p_loss_exact_mw": 0.35207593717787805,
+  "p_loss_nr_mw": 0.35207593717787855,
   "p_loss_error_mw": 4.996003610813204e-16,
   "q_loss_error_mvar": 1.1657341758564144e-15,
   "nr_iterations": 5

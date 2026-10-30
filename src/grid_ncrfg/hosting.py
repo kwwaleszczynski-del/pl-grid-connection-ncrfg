@@ -1,4 +1,4 @@
-"""Hosting capacity evaluation, non-firm curtailment trade-off, and GPZ N-0/N-1 transformer loading."""
+"""Hosting capacity search, export-cap energy trade-off, co-located BESS dispatch, and GPZ N-1 time series."""
 
 from __future__ import annotations
 
@@ -9,18 +9,23 @@ from .network import NetworkModel, build_polish_gpz_network
 from .ncrfg import (
     CONTROL_REGIMES,
     compute_cos_phi_p_q_mvar,
-    compute_qu_droop_q_mvar,
+    make_qu_law,
+    qu_q_limit_mvar,
     solve_feeder_with_ncrfg,
 )
-from .powerflow import solve_ac_powerflow
+from .powerflow import PowerFlowResult, solve_ac_powerflow
 from .profiles import generate_annual_polish_profiles
+
+
+V_MAX_PU: float = 1.050
+GPZ_EXISTING_GEN_MW: float = 8.0   # assumed PV already connected at the GPZ 15 kV busbar (scenario input)
 
 
 def find_feeder_hosting_capacity_mw(
     net: NetworkModel,
     feeder_code: str,
     regime_code: str,
-    v_max_limit_pu: float = 1.050,
+    v_max_limit_pu: float = V_MAX_PU,
     loading_limit_pct: float = 100.0,
     p_max_search_mw: float = 40.0,
 ) -> dict[str, float | str]:
@@ -30,7 +35,7 @@ def find_feeder_hosting_capacity_mw(
     br_ids = list(fspec.branch_ids)
 
     lo, hi = 0.0, p_max_search_mw
-    for _ in range(15):
+    for _ in range(18):
         mid = 0.5 * (lo + hi)
         res = solve_feeder_with_ncrfg(net, feeder_code, mid, regime_code)
         vmax = float(np.max(res.v_mag_pu[bus_ids]))
@@ -41,106 +46,105 @@ def find_feeder_hosting_capacity_mw(
             hi = mid
 
     res_opt = solve_feeder_with_ncrfg(net, feeder_code, lo, regime_code)
-    res_hi = solve_feeder_with_ncrfg(net, feeder_code, lo + 0.05, regime_code)
+    res_hi = solve_feeder_with_ncrfg(net, feeder_code, hi, regime_code)
     vmax_opt = float(np.max(res_opt.v_mag_pu[bus_ids]))
     imax_opt = float(np.max(res_opt.branch_loading_pct[br_ids]))
     vmax_hi = float(np.max(res_hi.v_mag_pu[bus_ids]))
-    imax_hi = float(np.max(res_hi.branch_loading_pct[br_ids]))
-
-    binding = "PCC voltage (+5.0 %)" if (vmax_hi - v_max_limit_pu) * 20.0 >= (imax_hi - loading_limit_pct) / 100.0 else "Thermal ampacity (I_dd)"
-    q_pcc = float(np.sum(res_opt.q_inj_mvar[bus_ids])) + sum(net.buses[b].q_load_min_mvar for b in bus_ids)
+    binding = "PCC voltage (+5.0 %)" if vmax_hi > v_max_limit_pu else "Thermal ampacity (I_dd)"
+    q_plant = float(np.sum(res_opt.q_inj_mvar[bus_ids])) + sum(net.buses[b].q_load_min_mvar for b in bus_ids)
     p_loss_kw = float(np.sum(res_opt.branch_p_loss_mw[br_ids]) * 1000.0)
 
     return {
         "feeder": feeder_code,
         "regime": regime_code,
-        "hosting_capacity_mw": round(lo, 2),
+        "hosting_capacity_mw": float(np.floor(lo * 100.0) / 100.0),  # rounded down: stays feasible
         "v_pcc_pu": round(vmax_opt, 4),
         "max_branch_loading_pct": round(imax_opt, 1),
-        "q_net_mvar": round(q_pcc, 2),
+        "q_net_mvar": round(q_plant, 2),
         "feeder_loss_kw": round(p_loss_kw, 1),
         "binding_constraint": binding,
     }
 
 
+def solve_gpz_busbar_injection(
+    net: NetworkModel,
+    p_new_mw: float,
+    regime_code: str = "uncontrolled",
+    p_existing_mw: float = GPZ_EXISTING_GEN_MW,
+    load_scale: float | None = None,
+) -> PowerFlowResult:
+    """AC power flow with new generation connected at the GPZ 15 kV busbar (bus 1) by a dedicated bay.
+
+    Existing generation p_existing_mw also sits on the busbar at cos phi = 1. Loads are the minimum daytime
+    loads, or the peak loads times load_scale when given.
+    """
+    reg = CONTROL_REGIMES[regime_code]
+    n = len(net.buses)
+    if load_scale is None:
+        p_load = np.array([b.p_load_min_mw for b in net.buses], dtype=float)
+        q_load = np.array([b.q_load_min_mvar for b in net.buses], dtype=float)
+    else:
+        p_load = np.array([b.p_load_peak_mw * load_scale for b in net.buses], dtype=float)
+        q_load = np.array([b.q_load_peak_mvar * load_scale for b in net.buses], dtype=float)
+    p_gen = np.zeros(n, dtype=float)
+    q_gen = np.zeros(n, dtype=float)
+    p_gen[1] = p_new_mw + p_existing_mw
+    if reg.uses_cos_phi_p:
+        q_gen[1] = float(compute_cos_phi_p_q_mvar(p_new_mw, p_nom_mw=max(p_new_mw, 1e-6)))
+    if reg.uses_qu_droop and p_new_mw > 1e-6:
+        return solve_ac_powerflow(
+            net, p_gen_mw=p_gen, q_gen_mvar=q_gen, p_load_mw=p_load, q_load_mvar=q_load,
+            q_of_v_buses=np.array([1]), q_of_v=make_qu_law(np.array([qu_q_limit_mvar(p_new_mw, p_new_mw)])),
+        )
+    return solve_ac_powerflow(net, p_gen_mw=p_gen, q_gen_mvar=q_gen, p_load_mw=p_load, q_load_mvar=q_load)
+
+
 def find_gpz_substation_hosting_capacity_mw(
     net_n1: NetworkModel,
     regime_code: str,
-    s_tr_limit_mva: float | None = None,
+    p_existing_mw: float = GPZ_EXISTING_GEN_MW,
+    v_max_limit_pu: float = V_MAX_PU,
 ) -> dict[str, float | str]:
-    """Find total GPZ 110/15 kV substation hosting capacity [MW] under N-1 (one 25 MVA transformer tripped).
+    """Find the GPZ 110/15 kV hosting capacity [MW] for new generation at the 15 kV busbar under N-1.
 
-    Generation is distributed across Feeders F1 (24 %), F2 (33 %), and F3 (43 %) while Feeder F4
-    serves industrial/municipal background load.
+    The network passed in has one 25 MVA transformer out of service. Feasible means: remaining transformer
+    S <= 25 MVA, every bus voltage <= v_max_limit_pu and every 15 kV branch within its ampacity, at minimum
+    load with the existing busbar generation at full output.
     """
-    reg = CONTROL_REGIMES[regime_code]
-    s_lim = s_tr_limit_mva if s_tr_limit_mva is not None else net_n1.substation.s_n1_mva
-    n = len(net_n1.buses)
-    p_load = np.array([b.p_load_min_mw for b in net_n1.buses], dtype=float)
-    q_load = np.array([b.q_load_min_mvar for b in net_n1.buses], dtype=float)
-
-    # Account for 8.35 MW of existing committed MV generation on the GPZ 15 kV busbar under N-1 (25 MVA)
-    p_committed_gpz_mw = 8.35
-    weights = {"F1": 0.24, "F2": 0.33, "F3": 0.43}
-
-    def _eval_gpz(p_total_inst_mw: float):
-        p_exp_total = p_total_inst_mw * reg.export_cap_share
-        p_gen = np.zeros(n, dtype=float)
-        q_gen = np.zeros(n, dtype=float)
-        p_gen[1] = p_committed_gpz_mw
-        for fcode, w_f in weights.items():
-            fspec = net_n1.feeders[fcode]
-            p_f = p_exp_total * w_f
-            pcc_b = fspec.pcc_bus_id
-            adj_b = fspec.bus_ids[-2]
-            p_gen[pcc_b] = 0.75 * p_f
-            p_gen[adj_b] = 0.25 * p_f
-            if reg.uses_cos_phi_p:
-                q_f = float(compute_cos_phi_p_q_mvar(p_f, p_nom_mw=max(p_f, 1e-6)))
-                q_gen[pcc_b] = 0.75 * q_f
-                q_gen[adj_b] = 0.25 * q_f
-
-        res = solve_ac_powerflow(net_n1, p_gen_mw=p_gen, q_gen_mvar=q_gen, p_load_mw=p_load, q_load_mvar=q_load)
-        if reg.uses_qu_droop and p_total_inst_mw > 1e-6:
-            for _ in range(8):
-                for fcode, w_f in weights.items():
-                    fspec = net_n1.feeders[fcode]
-                    p_f = p_exp_total * w_f
-                    pcc_b = fspec.pcc_bus_id
-                    adj_b = fspec.bus_ids[-2]
-                    q_pcc = float(compute_qu_droop_q_mvar(res.v_mag_pu[pcc_b], p_nom_mw=0.75 * p_f))
-                    q_adj = float(compute_qu_droop_q_mvar(res.v_mag_pu[adj_b], p_nom_mw=0.25 * p_f))
-                    q_gen[pcc_b] = 0.55 * q_gen[pcc_b] + 0.45 * q_pcc
-                    q_gen[adj_b] = 0.55 * q_gen[adj_b] + 0.45 * q_adj
-                res = solve_ac_powerflow(
-                    net_n1, p_gen_mw=p_gen, q_gen_mvar=q_gen, p_load_mw=p_load, q_load_mvar=q_load
-                )
-        return res
+    def _feasible(res: PowerFlowResult) -> tuple[bool, str]:
+        if res.tr_loading_n1_pct > 100.0:
+            return False, "N-1 transformer (25 MVA)"
+        if float(np.max(res.v_mag_pu[1:])) > v_max_limit_pu:
+            return False, "Bus voltage (+5.0 %)"
+        if float(np.max(res.branch_loading_pct[1:])) > 100.0:
+            return False, "Feeder ampacity"
+        return True, ""
 
     lo, hi = 0.0, 50.0
-    for _ in range(15):
+    for _ in range(18):
         mid = 0.5 * (lo + hi)
-        res = _eval_gpz(mid)
-        if res.tr_s_mva <= s_lim:
+        ok, _ = _feasible(solve_gpz_busbar_injection(net_n1, mid, regime_code, p_existing_mw))
+        if ok:
             lo = mid
         else:
             hi = mid
 
-    res_opt = _eval_gpz(lo)
+    res_opt = solve_gpz_busbar_injection(net_n1, lo, regime_code, p_existing_mw)
+    _, binding = _feasible(solve_gpz_busbar_injection(net_n1, hi, regime_code, p_existing_mw))
     return {
         "feeder": "GPZ_N1",
         "regime": regime_code,
-        "hosting_capacity_mw": round(lo, 2),
-        "v_pcc_pu": round(float(np.max(res_opt.v_mag_pu[2:])), 4),
+        "hosting_capacity_mw": float(np.floor(lo * 100.0) / 100.0),  # rounded down: stays feasible
+        "v_pcc_pu": round(float(np.max(res_opt.v_mag_pu[1:])), 4),
         "max_branch_loading_pct": round(float(res_opt.tr_loading_n1_pct), 1),
-        "q_net_mvar": round(float(np.sum(res_opt.q_inj_mvar[2:])), 2),
+        "q_net_mvar": round(float(res_opt.q_inj_mvar[1] + net_n1.buses[1].q_load_min_mvar), 2),
         "feeder_loss_kw": round(float(res_opt.total_p_loss_mw * 1000.0), 1),
-        "binding_constraint": "N-1 Transformer (25 MVA)",
+        "binding_constraint": binding,
     }
 
 
 def compute_hosting_capacity_table(net_n1: NetworkModel | None = None) -> pd.DataFrame:
-    """Compute the full hosting capacity matrix across F1, F2, F3, and GPZ N-1 for all 5 regimes."""
+    """Compute the hosting capacity matrix across F1, F2, F3 and the GPZ busbar (N-1) for all regimes."""
     net = net_n1 or build_polish_gpz_network(n_transformers=1)
     rows = []
     for fcode in ["F1", "F2", "F3"]:
@@ -155,208 +159,253 @@ def compute_annual_reactive_loss_comparison(
     net: NetworkModel | None = None,
     df_profiles: pd.DataFrame | None = None,
     feeder_code: str = "F1",
-    p_inst_mw: float = 6.2,
+    p_inst_mw: float = 2.0,
 ) -> dict[str, float]:
-    """Compare annual feeder active losses and reactive circulation between fixed cos-phi=0.95 and Q(U) droop."""
+    """Hourly AC power flow over all generating hours: reactive energy and extra feeder losses per regime.
+
+    Extra losses are the feeder I^2 R losses of a regime minus those of the unity power factor run in the
+    same hour (signed, summed over the year).
+    """
     net = net or build_polish_gpz_network(n_transformers=2)
     df = df_profiles if df_profiles is not None else generate_annual_polish_profiles()
     fspec = net.feeders[feeder_code]
     br_ids = list(fspec.branch_ids)
+    plant_buses = [fspec.pcc_bus_id, fspec.bus_ids[-2]]
 
-    # Evaluate representative bins of (pv_cf, load_scale) across the 8,760-hour year
     pv_cf = df["pv_cf"].to_numpy()
     load_sc = df["load_scale"].to_numpy()
+    gen_hours = np.flatnonzero(pv_cf > 0.0)
 
-    # Quantize active horarios (pv_cf > 0.01) into 40 representative operating states for fast exact evaluation
-    active_mask = pv_cf > 0.01
-    n_active_hours = int(np.sum(active_mask))
+    q_abs = {"cos_phi_p": 0.0, "qu_droop": 0.0}
+    hours_q = {"cos_phi_p": 0, "qu_droop": 0}
+    extra_loss = {"cos_phi_p": 0.0, "qu_droop": 0.0}
+    v_max = {"uncontrolled": 0.0, "cos_phi_p": 0.0, "qu_droop": 0.0}
+    for h in gen_hours:
+        cf_h = float(pv_cf[h])
+        ld_h = float(load_sc[h])
+        res = {
+            rc: solve_feeder_with_ncrfg(net, feeder_code, p_inst_mw, rc, cf_avail=cf_h, load_scale=ld_h)
+            for rc in v_max
+        }
+        loss_unc = float(np.sum(res["uncontrolled"].branch_p_loss_mw[br_ids]))
+        for rc, r in res.items():
+            v_max[rc] = max(v_max[rc], float(r.v_mag_pu[fspec.pcc_bus_id]))
+        q_plant = {
+            "cos_phi_p": float(compute_cos_phi_p_q_mvar(p_inst_mw * cf_h, p_nom_mw=p_inst_mw)),
+            "qu_droop": float(np.sum(res["qu_droop"].q_v_mvar[plant_buses])),
+        }
+        for rc in q_abs:
+            q_abs[rc] += max(0.0, -q_plant[rc])
+            hours_q[rc] += int(q_plant[rc] < -1e-9)
+            extra_loss[rc] += float(np.sum(res[rc].branch_p_loss_mw[br_ids])) - loss_unc
 
-    q_mvarh_fixed = 0.0
-    q_mvarh_qu = 0.0
-    extra_loss_mwh_fixed = 0.0
-    extra_loss_mwh_qu = 0.0
-
-    # Group into 25 (pv_cf, load_scale) quantile buckets across the year
-    df_act = pd.DataFrame({"pv": pv_cf[active_mask], "ld": load_sc[active_mask]})
-    df_act["bin"] = pd.qcut(df_act["pv"], q=25, labels=False, duplicates="drop")
-    for _, grp in df_act.groupby("bin", observed=True):
-        w_hours = float(len(grp))
-        cf_m = float(grp["pv"].mean())
-        ld_m = float(grp["ld"].mean())
-
-        res_unc = solve_feeder_with_ncrfg(net, feeder_code, p_inst_mw, "uncontrolled", cf_avail=cf_m, load_scale=ld_m)
-        res_fix = solve_feeder_with_ncrfg(net, feeder_code, p_inst_mw, "cos_phi_fixed", cf_avail=cf_m, load_scale=ld_m)
-        res_qu = solve_feeder_with_ncrfg(net, feeder_code, p_inst_mw, "qu_droop", cf_avail=cf_m, load_scale=ld_m)
-
-        loss_unc = float(np.sum(res_unc.branch_p_loss_mw[br_ids]))
-        loss_fix = float(np.sum(res_fix.branch_p_loss_mw[br_ids]))
-        loss_qu = float(np.sum(res_qu.branch_p_loss_mw[br_ids]))
-
-        p_exp = p_inst_mw * cf_m
-        q_fix = abs(float(compute_cos_phi_p_q_mvar(p_exp, p_nom_mw=p_inst_mw)))
-        q_qu = abs(
-            float(
-                compute_qu_droop_q_mvar(
-                    float(res_qu.v_mag_pu[fspec.pcc_bus_id]), p_nom_mw=p_inst_mw, p_avail_mw=p_exp
-                )
-            )
-        )
-
-        q_mvarh_fixed += w_hours * q_fix
-        q_mvarh_qu += w_hours * q_qu
-        extra_loss_mwh_fixed += w_hours * max(0.0, loss_fix - loss_unc)
-        extra_loss_mwh_qu += w_hours * max(0.0, loss_qu - loss_unc)
-
-    reduction_pct = 100.0 * (1.0 - extra_loss_mwh_qu / max(1e-6, extra_loss_mwh_fixed))
     return {
         "p_inst_mw": p_inst_mw,
-        "generating_hours": n_active_hours,
-        "q_absorbed_fixed_mvarh": round(q_mvarh_fixed, 1),
-        "q_absorbed_qu_mvarh": round(q_mvarh_qu, 1),
-        "reactive_loss_fixed_mwh": round(extra_loss_mwh_fixed, 2),
-        "reactive_loss_qu_mwh": round(extra_loss_mwh_qu, 2),
-        "reactive_loss_reduction_pct": round(reduction_pct, 1),
+        "generating_hours": int(len(gen_hours)),
+        "energy_mwh": round(float(np.sum(pv_cf)) * p_inst_mw, 1),
+        "q_hours_cosphi": hours_q["cos_phi_p"],
+        "q_hours_qu": hours_q["qu_droop"],
+        "q_absorbed_cosphi_mvarh": round(q_abs["cos_phi_p"], 1),
+        "q_absorbed_qu_mvarh": round(q_abs["qu_droop"], 1),
+        "extra_loss_cosphi_mwh": round(extra_loss["cos_phi_p"], 3),
+        "extra_loss_qu_mwh": round(extra_loss["qu_droop"], 3),
+        "q_reduction_pct": round(100.0 * (1.0 - q_abs["qu_droop"] / max(1e-9, q_abs["cos_phi_p"])), 1),
+        "extra_loss_reduction_pct": round(
+            100.0 * (1.0 - extra_loss["qu_droop"] / max(1e-9, extra_loss["cos_phi_p"])), 1
+        ),
+        "v_pcc_max_uncontrolled_pu": round(v_max["uncontrolled"], 4),
+        "v_pcc_max_cosphi_pu": round(v_max["cos_phi_p"], 4),
+        "v_pcc_max_qu_pu": round(v_max["qu_droop"], 4),
+    }
+
+
+def dispatch_export_limited_bess(
+    p_avail_mw: np.ndarray,
+    p_limit_mw: float,
+    p_bess_mw: float,
+    e_bess_mwh: float,
+    eta_roundtrip: float = 0.90,
+    soc0_mwh: float = 0.0,
+) -> dict[str, np.ndarray | float]:
+    """Hourly dispatch of a battery sharing an export limit with the generation behind it.
+
+    Each hour the battery charges from generation above p_limit_mw (limited by its power and free energy),
+    and otherwise discharges into the remaining headroom under the limit (limited by power and stored energy).
+    Generation that can be neither exported nor stored is spilled. Charge and discharge efficiencies are both
+    sqrt(eta_roundtrip).
+    """
+    p_avail = np.asarray(p_avail_mw, dtype=float)
+    eta = float(np.sqrt(eta_roundtrip))
+    n = len(p_avail)
+    export = np.zeros(n)
+    charge = np.zeros(n)
+    discharge = np.zeros(n)
+    spilled = np.zeros(n)
+    soc = np.zeros(n)
+    s = float(soc0_mwh)
+    for t in range(n):
+        surplus = p_avail[t] - p_limit_mw
+        if surplus > 0.0:
+            ch = min(surplus, p_bess_mw, max(0.0, e_bess_mwh - s) / eta)
+            s += ch * eta
+            charge[t] = ch
+            spilled[t] = surplus - ch
+            export[t] = p_limit_mw
+        else:
+            dis = min(p_bess_mw, -surplus, s * eta)
+            s -= dis / eta
+            discharge[t] = dis
+            export[t] = p_avail[t] + dis
+        soc[t] = s
+    return {
+        "export_mw": export,
+        "charge_mw": charge,
+        "discharge_mw": discharge,
+        "spilled_mw": spilled,
+        "soc_mwh": soc,
+        "conversion_loss_mwh": float(np.sum(charge) - np.sum(discharge) - (s - soc0_mwh)),
     }
 
 
 def compute_curtailment_tradeoff(
     df_profiles: pd.DataFrame | None = None,
-    f1_firm_qu_mw: float = 11.41,
-    gpz_firm_qu_mw: float = 21.70,
+    bess_power_share: float = 0.35,
+    bess_hours: float = 2.0,
 ) -> pd.DataFrame:
-    """Compute annual curtailed energy [%] vs unlocked connectable MW for export caps 50 %..100 %."""
+    """Annual energy cost of an active power export cap (50 %..100 % of P_inst) for PV, with and without BESS.
+
+    Per MW of installed PV (AC). The battery is sized relative to P_inst (bess_power_share * P_inst, bess_hours
+    of storage) and dispatched hourly by dispatch_export_limited_bess. installed_per_export_mw = 1 / cap is the
+    arithmetic oversizing the cap allows on a fixed export limit; energy_gain_vs_firm_pct is the extra annual
+    energy that oversized, capped plant delivers through the same export limit compared with a firm plant.
+    """
     df = df_profiles if df_profiles is not None else generate_annual_polish_profiles()
     pv_cf = df["pv_cf"].to_numpy()
-    total_avail_flh = float(np.sum(pv_cf))
+    total_avail = float(np.sum(pv_cf))
 
     caps = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00]
     rows = []
     for cap in caps:
-        exported_cf = np.minimum(pv_cf, cap)
-        curtailed_cf = np.maximum(0.0, pv_cf - cap)
-        curt_pct = 100.0 * float(np.sum(curtailed_cf)) / total_avail_flh
-        hours_curt = int(np.sum(pv_cf > cap + 1e-6))
-
-        # Co-located 2 h BESS (power = 0.35 P_inst, usable energy = 0.70 P_inst MWh, RTE = 90 %)
-        # absorbs daily midday peak above cap and discharges in evening
-        daily_curt = curtailed_cf.reshape(-1, 24).sum(axis=1)
-        bess_absorbed_daily = np.minimum(daily_curt, 0.70)
-        rem_spilled_flh = float(np.sum(daily_curt - bess_absorbed_daily)) + float(np.sum(bess_absorbed_daily) * 0.10)
-        bess_spilled_pct = 100.0 * rem_spilled_flh / total_avail_flh
-
-        f1_connectable_mw = f1_firm_qu_mw / cap
-        gpz_connectable_mw = gpz_firm_qu_mw / cap
-        overbuild_gain_pct = 100.0 * (1.0 / cap - 1.0)
-
+        exported = np.minimum(pv_cf, cap)
+        bess = dispatch_export_limited_bess(pv_cf, cap, bess_power_share, bess_power_share * bess_hours)
+        exported_bess = float(np.sum(bess["export_mw"]))
         rows.append(
             {
                 "export_cap_pct": int(round(cap * 100)),
                 "export_cap_share": cap,
-                "curtailed_energy_pct": round(curt_pct, 2),
-                "curtailed_hours_per_yr": hours_curt,
-                "bess_2h_spilled_pct": round(bess_spilled_pct, 2),
-                "f1_connectable_mw": round(f1_connectable_mw, 2),
-                "gpz_n1_connectable_mw": round(gpz_connectable_mw, 2),
-                "capacity_gain_pct": round(overbuild_gain_pct, 1),
-                "annual_export_mwh_per_mw_grid": round(float(np.sum(exported_cf)) / cap, 1),
+                "curtailed_energy_pct": round(100.0 * (total_avail - float(np.sum(exported))) / total_avail, 2),
+                "curtailed_hours_per_yr": int(np.sum(pv_cf > cap + 1e-9)),
+                "bess_lost_energy_pct": round(100.0 * (total_avail - exported_bess) / total_avail, 2),
+                "installed_per_export_mw": round(1.0 / cap, 3),
+                "annual_export_mwh_per_mw_grid": round(float(np.sum(exported)) / cap, 1),
+                "energy_gain_vs_firm_pct": round(100.0 * (float(np.sum(exported)) / cap / total_avail - 1.0), 1),
+                "bess_energy_gain_vs_firm_pct": round(100.0 * (exported_bess / cap / total_avail - 1.0), 1),
             }
         )
     return pd.DataFrame(rows)
 
 
 def compute_n1_transformer_study(
+    net_n1: NetworkModel | None = None,
     df_profiles: pd.DataFrame | None = None,
+    p_firm_mw: float = 20.0,
+    export_cap_share: float = 0.70,
+    wind_share: float = 0.50,
+    bess_power_share: float = 0.25,
+    bess_hours: float = 2.0,
+    p_existing_mw: float = GPZ_EXISTING_GEN_MW,
 ) -> dict:
-    """Evaluate 8,760-hour GPZ 110/15 kV transformer apparent power S [MVA] under N-0 and N-1."""
+    """Hourly AC power flow of the GPZ under N-1 (one 25 MVA transformer out) for three busbar scenarios.
+
+    All new generation sits at the GPZ 15 kV busbar at cos phi = 1 with an export limit of p_firm_mw:
+      A. firm PV of p_firm_mw;
+      B. PV of p_firm_mw / export_cap_share with export capped at p_firm_mw;
+      C. cable pooling: PV of p_firm_mw plus wind of wind_share * p_firm_mw behind the same p_firm_mw limit,
+         with a co-located battery of bess_power_share * p_firm_mw for bess_hours (dispatch_export_limited_bess).
+    Existing busbar PV (p_existing_mw) follows the same PV profile; loads follow load_scale x peak load.
+    Each hour is solved with the Newton-Raphson power flow on the N-1 network (OLTC regulating the busbar).
+    """
+    net = net_n1 or build_polish_gpz_network(n_transformers=1)
     df = df_profiles if df_profiles is not None else generate_annual_polish_profiles()
     pv_cf = df["pv_cf"].to_numpy()
     wind_cf = df["wind_cf"].to_numpy()
     load_sc = df["load_scale"].to_numpy()
+    n_h = len(df)
 
-    # Total GPZ peak load across F1..F4 = 11.97 MW, min load = 4.70 MW; existing committed MV RES = 8.35 MW
-    p_load_gpz = 4.70 + (11.97 - 4.70) * ((load_sc - 0.33) / 0.67)
-    q_load_gpz = 0.34 * p_load_gpz
-    p_committed = 8.35 * (0.65 * pv_cf + 0.35 * wind_cf)
+    p_a = p_firm_mw * pv_cf
+    p_pv_b = p_firm_mw / export_cap_share * pv_cf
+    p_b = np.minimum(p_pv_b, p_firm_mw)
+    p_avail_c = p_firm_mw * pv_cf + wind_share * p_firm_mw * wind_cf
+    bess = dispatch_export_limited_bess(
+        p_avail_c, p_firm_mw, bess_power_share * p_firm_mw, bess_power_share * p_firm_mw * bess_hours
+    )
+    p_c = bess["export_mw"]
+    p_c_nobess = np.minimum(p_avail_c, p_firm_mw)
 
-    # Scenario A: 21.5 MW new PV uncontrolled (firm N-1 limit)
-    p_net_a = 21.5 * pv_cf + p_committed - p_load_gpz
-    q_net_a = -q_load_gpz + 0.045 * (p_net_a ** 2) / 10.0
-    s_mva_a = np.sqrt(p_net_a ** 2 + q_net_a ** 2)
+    scen = {"firm_pv": p_a, "capped_pv": p_b, "pooling_bess": p_c}
+    s_mva = {k: np.zeros(n_h) for k in scen}
+    v_max_pu = {k: 0.0 for k in scen}
+    for h in range(n_h):
+        solved: dict[float, tuple[float, float]] = {}  # scenarios with identical injection share one solve
+        for k, p_new in scen.items():
+            key = float(p_new[h])
+            if key not in solved:
+                res = solve_gpz_busbar_injection(
+                    net, key, "uncontrolled", p_existing_mw * float(pv_cf[h]), load_scale=float(load_sc[h])
+                )
+                solved[key] = (res.tr_s_mva, float(np.max(res.v_mag_pu[1:])))
+            s_mva[k][h], v_h = solved[key]
+            v_max_pu[k] = max(v_max_pu[k], v_h)
 
-    # Scenario B: 31.0 MW new PV with 70 % non-firm export cap + Q(U)
-    p_pv_b = np.minimum(31.0 * pv_cf, 31.0 * 0.70)
-    p_net_b = p_pv_b + p_committed - p_load_gpz
-    q_qu_b = np.where(p_pv_b > 14.0, -0.18 * (p_pv_b - 14.0), 0.0)
-    q_net_b = q_qu_b - q_load_gpz + 0.045 * (p_net_b ** 2) / 10.0
-    s_mva_b = np.sqrt(p_net_b ** 2 + q_net_b ** 2)
-
-    # Scenario C: Cable pooling (22.5 MW PV + 14.0 MW Wind = 36.5 MW) + co-located 2 h BESS (10 MW / 20 MWh)
-    p_raw_c = 22.5 * pv_cf + 14.0 * wind_cf
-    p_cap_c = 21.35  # GPZ shared export limit so S_TR <= 25.0 MVA under N-1
-    p_bess_ch = np.zeros_like(p_raw_c)
-    p_bess_dis = np.zeros_like(p_raw_c)
-    p_spilled = np.zeros_like(p_raw_c)
-    soc_mwh = 2.0
-    e_max_mwh = 24.0
-    p_bess_max = 12.0
-
-    for t in range(len(p_raw_c)):
-        surplus = p_raw_c[t] - p_cap_c
-        if surplus > 0.0:
-            ch = min(surplus, p_bess_max, (e_max_mwh - soc_mwh) / 0.95)
-            p_bess_ch[t] = ch
-            soc_mwh += ch * 0.95
-            p_spilled[t] = max(0.0, surplus - ch)
-        elif p_raw_c[t] < 0.45 * p_cap_c and soc_mwh > 0.5:
-            dis = min(p_bess_max, 0.55 * p_cap_c - p_raw_c[t], soc_mwh * 0.95)
-            p_bess_dis[t] = max(0.0, dis)
-            soc_mwh -= p_bess_dis[t] / 0.95
-
-    p_exp_c = p_raw_c - p_bess_ch + p_bess_dis - p_spilled
-    p_net_c = p_exp_c + p_committed - p_load_gpz
-    q_qu_c = np.where(p_exp_c > 14.0, -0.20 * (p_exp_c - 14.0), 0.0)
-    q_net_c = q_qu_c - q_load_gpz + 0.045 * (p_net_c ** 2) / 10.0
-    s_mva_c = np.minimum(24.95, np.sqrt(p_net_c ** 2 + q_net_c ** 2))
-
-    spilled_pct_c = 100.0 * float(np.sum(p_spilled)) / float(np.sum(p_raw_c))
-
-    # Build 12x24 seasonal mean peak loading heatmap (MVA) for Scenario C
-    df_hm = pd.DataFrame({"month": df["month"].to_numpy(), "hour": df["hour"].to_numpy(), "s_mva": s_mva_c})
+    s_lim = net.substation.s_n1_mva
+    df_hm = pd.DataFrame({"month": df["month"].to_numpy(), "hour": df["hour"].to_numpy(), "s_mva": s_mva["pooling_bess"]})
     hm_pivot = df_hm.pivot_table(index="month", columns="hour", values="s_mva", aggfunc=lambda x: np.percentile(x, 95))
-    heatmap_matrix = np.round(hm_pivot.to_numpy(), 2).tolist()
+    idx_dc = np.linspace(0, n_h - 1, 181, dtype=int)
 
-    # Sample 180 points along the 8,760-hour duration curve
-    idx_dc = np.linspace(0, len(s_mva_a) - 1, 181, dtype=int)
-    hours_dc = [int(x) for x in idx_dc]
-
-    return {
-        "duration_hours": hours_dc,
-        "s_mva_uncontrolled_21p5mw": [round(float(x), 2) for x in np.sort(s_mva_a)[::-1][idx_dc]],
-        "s_mva_nonfirm_31mw": [round(float(x), 2) for x in np.sort(s_mva_b)[::-1][idx_dc]],
-        "s_mva_pooling_bess_36p5mw": [round(float(x), 2) for x in np.sort(s_mva_c)[::-1][idx_dc]],
-        "max_s_uncontrolled_mva": round(float(np.max(s_mva_a)), 2),
-        "max_s_nonfirm_mva": round(float(np.max(s_mva_b)), 2),
-        "max_s_pooling_bess_mva": round(float(np.max(s_mva_c)), 2),
-        "pooling_spilled_energy_pct": round(spilled_pct_c, 2),
-        "heatmap_p95_mva": heatmap_matrix,
+    out: dict = {
+        "p_firm_mw": p_firm_mw,
+        "p_existing_mw": p_existing_mw,
+        "export_cap_share": export_cap_share,
+        "capped_pv_mw": round(p_firm_mw / export_cap_share, 2),
+        "pooling_pv_mw": p_firm_mw,
+        "pooling_wind_mw": round(wind_share * p_firm_mw, 2),
+        "pooling_bess_mw": round(bess_power_share * p_firm_mw, 2),
+        "pooling_bess_mwh": round(bess_power_share * p_firm_mw * bess_hours, 2),
+        "s_limit_mva": s_lim,
+        "duration_hours": [int(x) for x in idx_dc],
+        "heatmap_p95_mva": np.round(hm_pivot.to_numpy(), 2).tolist(),
     }
+    energy = {"firm_pv": float(np.sum(p_a)), "capped_pv": float(np.sum(p_b)), "pooling_bess": float(np.sum(p_c))}
+    for k in scen:
+        out[f"s_mva_{k}"] = [round(float(x), 2) for x in np.sort(s_mva[k])[::-1][idx_dc]]
+        out[f"max_s_{k}_mva"] = round(float(np.max(s_mva[k])), 2)
+        out[f"hours_over_limit_{k}"] = int(np.sum(s_mva[k] > s_lim + 1e-6))
+        out[f"hours_above_90pct_{k}"] = int(np.sum(s_mva[k] > 0.9 * s_lim))
+        out[f"max_v_{k}_pu"] = round(v_max_pu[k], 4)
+        out[f"export_gwh_{k}"] = round(energy[k] / 1000.0, 2)
+    out["capped_curtailed_pct"] = round(100.0 * (1.0 - float(np.sum(p_b)) / float(np.sum(p_pv_b))), 2)
+    out["pooling_spilled_nobess_pct"] = round(100.0 * (1.0 - float(np.sum(p_c_nobess)) / float(np.sum(p_avail_c))), 2)
+    out["pooling_lost_bess_pct"] = round(100.0 * (1.0 - float(np.sum(p_c)) / float(np.sum(p_avail_c))), 2)
+    out["pooling_bess_conversion_loss_mwh"] = round(float(bess["conversion_loss_mwh"]), 1)
+    return out
 
 
 def simulate_sunny_week_trace(
     net: NetworkModel | None = None,
     df_profiles: pd.DataFrame | None = None,
     feeder_code: str = "F1",
-    p_inst_mw: float = 11.4,
+    p_inst_mw: float = 3.0,
 ) -> dict:
-    """Simulate a 7-day sunny May week (168 hours, 18-24 May 2026) on Feeder F1 across control modes."""
+    """Simulate a 7-day sunny May week (168 hours, 18-24 May) on a feeder across the control regimes."""
     net = net or build_polish_gpz_network(n_transformers=2)
     df = df_profiles if df_profiles is not None else generate_annual_polish_profiles()
     fspec = net.feeders[feeder_code]
     br_ids = list(fspec.branch_ids)
+    year = int(df["ts_local"].iloc[0].year)
 
     ts_pl = df["ts_local"]
-    mask = (ts_pl >= pd.Timestamp("2026-05-18 00:00:00", tz="Europe/Warsaw")) & (
-        ts_pl < pd.Timestamp("2026-05-25 00:00:00", tz="Europe/Warsaw")
+    mask = (ts_pl >= pd.Timestamp(f"{year}-05-18 00:00:00", tz="Europe/Warsaw")) & (
+        ts_pl < pd.Timestamp(f"{year}-05-25 00:00:00", tz="Europe/Warsaw")
     )
     sub = df.loc[mask]
 
@@ -364,34 +413,29 @@ def simulate_sunny_week_trace(
     pv_cf = sub["pv_cf"].to_numpy()
     load_sc = sub["load_scale"].to_numpy()
 
-    modes = ["uncontrolled", "cos_phi_fixed", "qu_droop", "non_firm_70", "cable_pooling_bess"]
+    modes = list(CONTROL_REGIMES)
     traces: dict[str, dict[str, list[float]]] = {
         m: {"v_pcc_pu": [], "q_pcc_mvar": [], "p_exp_mw": [], "loss_kw": []} for m in modes
     }
+    plant_buses = [fspec.pcc_bus_id, fspec.bus_ids[-2]]
 
     for k in range(len(sub)):
         cf_k = float(pv_cf[k])
         ld_k = float(load_sc[k])
         for m in modes:
-            reg = CONTROL_REGIMES[m]
             res = solve_feeder_with_ncrfg(net, feeder_code, p_inst_mw, m, cf_avail=cf_k, load_scale=ld_k)
-            v_pcc = float(res.v_mag_pu[fspec.pcc_bus_id])
-            p_exp = min(p_inst_mw * cf_k, p_inst_mw * reg.export_cap_share)
-            q_inj = float(
-                res.q_inj_mvar[fspec.pcc_bus_id]
-                + res.q_inj_mvar[fspec.bus_ids[-2]]
-                + (net.buses[fspec.pcc_bus_id].q_load_peak_mvar + net.buses[fspec.bus_ids[-2]].q_load_peak_mvar) * ld_k
+            q_plant = float(
+                sum(res.q_inj_mvar[b] + net.buses[b].q_load_peak_mvar * ld_k for b in plant_buses)
             )
-            loss_kw = float(np.sum(res.branch_p_loss_mw[br_ids]) * 1000.0)
-            traces[m]["v_pcc_pu"].append(round(v_pcc, 4))
-            traces[m]["q_pcc_mvar"].append(round(q_inj, 3))
-            traces[m]["p_exp_mw"].append(round(p_exp, 2))
-            traces[m]["loss_kw"].append(round(loss_kw, 1))
+            traces[m]["v_pcc_pu"].append(round(float(res.v_mag_pu[fspec.pcc_bus_id]), 4))
+            traces[m]["q_pcc_mvar"].append(round(q_plant, 3))
+            traces[m]["p_exp_mw"].append(round(p_inst_mw * cf_k, 3))
+            traces[m]["loss_kw"].append(round(float(np.sum(res.branch_p_loss_mw[br_ids]) * 1000.0), 1))
 
     return {
         "timestamps": timestamps,
         "feeder": feeder_code,
         "p_inst_mw": p_inst_mw,
-        "pv_avail_mw": [round(float(p_inst_mw * x), 2) for x in pv_cf],
+        "pv_avail_mw": [round(float(p_inst_mw * x), 3) for x in pv_cf],
         "modes": traces,
     }

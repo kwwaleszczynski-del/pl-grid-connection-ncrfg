@@ -40,10 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     summary = run_full_pipeline(output_root=args.out)
     print(
         f"Completed grid connection study: F1 hosting capacity "
-        f"{summary['headline']['f1_uncontrolled_mw']} MW (uncontrolled) -> "
-        f"{summary['headline']['f1_cosphi_mw']} MW (cos-phi=0.95) -> "
-        f"{summary['headline']['f1_qu_mw']} MW (NC RfG Q(U)) -> "
-        f"{summary['headline']['f1_nonfirm70_mw']} MW (70% cap)."
+        f"{summary['headline']['f1_uncontrolled_mw']} MW (cos-phi=1) / "
+        f"{summary['headline']['f1_cosphi_mw']} MW (cos-phi(P)) / "
+        f"{summary['headline']['f1_qu_mw']} MW (Q(U)); GPZ N-1 "
+        f"{summary['headline']['gpz_n1_uncontrolled_mw']} MW."
     )
     return 0
 

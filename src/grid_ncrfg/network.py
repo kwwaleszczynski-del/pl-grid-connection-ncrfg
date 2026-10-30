@@ -1,4 +1,16 @@
-"""Polish 110/15 kV GPZ substation and 15 kV radial feeder network models and Ybus builder."""
+"""Polish 110/15 kV GPZ substation and 15 kV radial feeder network models and Ybus builder.
+
+Conductor data sources (catalogue values, to be verified against the supplier of an actual project):
+  - AFL-6 bare ACSR (PN-EN 50182): DC resistance at 20 C and overall diameter from the Tele-Fonika Kable
+    "AFL" catalogue sheet and the Eltrim Kable AFL-6 data sheet (max continuous conductor temperature 80 C).
+    Neither sheet gives reactance or ampacity, so series reactance and shunt susceptance are computed from the
+    conductor radius and an assumed geometric mean phase spacing, and ampacity from the IEEE Std 738-2012
+    steady-state heat balance under the summer weather assumptions in `acsr_ampacity_a`.
+  - NA2XS(F)2Y 12/20 kV single-core Al XLPE cables (three cores in trefoil): DC resistance at 20 C, capacitance,
+    trefoil inductance and continuous current rating in ground (trefoil, 0.7 m depth, soil 1.0 K m/W, screens
+    bonded at both ends) from the NKT data sheet "NA2XS(F)2Y (XUHAKXS) 12/20 kV" (catalogue pp. 207-211).
+Resistances are kept at 20 C (no temperature correction), which slightly understates voltage rise and losses.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +24,11 @@ BASE_KV_HV: float = 110.0
 Z_BASE_MV_OHM: float = (BASE_KV_MV ** 2) / BASE_MVA  # 22.5 Ohm
 Y_BASE_MV_S: float = 1.0 / Z_BASE_MV_OHM             # 0.044444 S
 I_BASE_MV_KA: float = BASE_MVA / (np.sqrt(3.0) * BASE_KV_MV)  # 0.384900 kA = 384.9 A
+
+F_HZ: float = 50.0
+MU0_OVER_2PI: float = 2.0e-7            # H/m
+EPS0: float = 8.854187817e-12           # F/m
+OVERHEAD_PHASE_SPACING_M: float = 1.0   # assumed geometric mean phase spacing of a 15 kV overhead line
 
 
 @dataclass(frozen=True)
@@ -34,46 +51,77 @@ class LineTypeSpec:
         return float(np.sqrt(3.0) * BASE_KV_MV * (self.i_dd_a / 1000.0))
 
 
+def acsr_ampacity_a(
+    d_mm: float,
+    r20_ohm_per_km: float,
+    t_amb_c: float = 35.0,
+    t_max_c: float = 80.0,
+    wind_m_s: float = 0.6,
+    solar_w_m2: float = 1000.0,
+    absorptivity: float = 0.5,
+    emissivity: float = 0.5,
+    alpha_r_per_k: float = 0.00403,
+) -> float:
+    """Steady-state ampacity [A] of a bare overhead conductor from the IEEE Std 738-2012 heat balance.
+
+    I = sqrt((q_c + q_r - q_s) / R(T_max)) with forced/natural convection q_c (wind perpendicular to the
+    conductor, sea level), radiation q_r and solar gain q_s, all in W/m. Defaults are a hot, calm summer
+    afternoon (35 C, 0.6 m/s, 1000 W/m2) at the 80 C continuous limit given for AFL-6 by its manufacturer.
+    """
+    d_m = d_mm / 1000.0
+    dt = t_max_c - t_amb_c
+    t_film = 0.5 * (t_max_c + t_amb_c)
+    mu_f = 1.458e-6 * (t_film + 273.0) ** 1.5 / (t_film + 383.4)
+    rho_f = 1.293 / (1.0 + 0.00367 * t_film)
+    k_f = 2.424e-2 + 7.477e-5 * t_film - 4.407e-9 * t_film ** 2
+    n_re = d_m * rho_f * wind_m_s / mu_f
+    q_c = max(
+        (1.01 + 1.35 * n_re ** 0.52) * k_f * dt,
+        0.754 * n_re ** 0.6 * k_f * dt,
+        3.645 * rho_f ** 0.5 * d_m ** 0.75 * dt ** 1.25,
+    )
+    q_r = 17.8 * d_m * emissivity * (((t_max_c + 273.0) / 100.0) ** 4 - ((t_amb_c + 273.0) / 100.0) ** 4)
+    q_s = absorptivity * solar_w_m2 * d_m
+    r_ohm_per_m = r20_ohm_per_km / 1000.0 * (1.0 + alpha_r_per_k * (t_max_c - 20.0))
+    return float(np.sqrt((q_c + q_r - q_s) / r_ohm_per_m))
+
+
+def _overhead_acsr(code: str, description: str, d_mm: float, r20_ohm_per_km: float) -> LineTypeSpec:
+    r_m = d_mm / 2000.0
+    gmr_m = np.exp(-0.25) * r_m
+    x_ohm_per_km = 2.0 * np.pi * F_HZ * MU0_OVER_2PI * np.log(OVERHEAD_PHASE_SPACING_M / gmr_m) * 1000.0
+    c_f_per_km = 2.0 * np.pi * EPS0 / np.log(OVERHEAD_PHASE_SPACING_M / r_m) * 1000.0
+    return LineTypeSpec(
+        code=code,
+        description=description,
+        r_ohm_per_km=r20_ohm_per_km,
+        x_ohm_per_km=float(x_ohm_per_km),
+        b_us_per_km=float(2.0 * np.pi * F_HZ * c_f_per_km * 1e6),
+        i_dd_a=acsr_ampacity_a(d_mm, r20_ohm_per_km),
+    )
+
+
+def _xlpe_cable(code: str, description: str, r20_ohm_per_km: float, l_mh_per_km: float,
+                c_uf_per_km: float, i_ground_a: float) -> LineTypeSpec:
+    return LineTypeSpec(
+        code=code,
+        description=description,
+        r_ohm_per_km=r20_ohm_per_km,
+        x_ohm_per_km=float(2.0 * np.pi * F_HZ * l_mh_per_km * 1e-3),
+        b_us_per_km=float(2.0 * np.pi * F_HZ * c_uf_per_km),
+        i_dd_a=i_ground_a,
+    )
+
+
 LINE_TYPES: dict[str, LineTypeSpec] = {
-    "AFL-6 120": LineTypeSpec(
-        code="AFL-6 120",
-        description="Overhead ACSR trunk exit AFL-6 120 mm2 (twin-circuit head section)",
-        r_ohm_per_km=0.110,
-        x_ohm_per_km=0.123,
-        b_us_per_km=5.80,
-        i_dd_a=520.0,
+    "AFL-6 120": _overhead_acsr("AFL-6 120", "Overhead ACSR AFL-6 120 mm2 (123-AL1/21-ST1A), trunk exit", 15.7, 0.2356),
+    "AFL-6 70": _overhead_acsr("AFL-6 70", "Overhead ACSR AFL-6 70 mm2 (66-AL1/11-ST1A), rural trunk", 11.3, 0.4324),
+    "AFL-6 50": _overhead_acsr("AFL-6 50", "Overhead ACSR AFL-6 50 mm2 (48-AL1/8-ST1A), rural spur", 9.6, 0.5939),
+    "NA2XS(F)2Y 1x150/25": _xlpe_cable(
+        "NA2XS(F)2Y 1x150/25", "Underground Al XLPE cable 12/20 kV, 3 x 1x150/25 in trefoil", 0.2060, 0.37, 0.25, 320.0
     ),
-    "AFL-6 70": LineTypeSpec(
-        code="AFL-6 70",
-        description="Overhead ACSR rural trunk AFL-6 70 mm2",
-        r_ohm_per_km=0.155,
-        x_ohm_per_km=0.163,
-        b_us_per_km=4.20,
-        i_dd_a=480.0,
-    ),
-    "AFL-6 50": LineTypeSpec(
-        code="AFL-6 50",
-        description="Overhead ACSR rural spur AFL-6 50 mm2",
-        r_ohm_per_km=0.178,
-        x_ohm_per_km=0.183,
-        b_us_per_km=3.80,
-        i_dd_a=460.0,
-    ),
-    "NA2XS(F)2Y 3x150": LineTypeSpec(
-        code="NA2XS(F)2Y 3x150",
-        description="Underground Al XLPE cable NA2XS(F)2Y 3x150 mm2",
-        r_ohm_per_km=0.146,
-        x_ohm_per_km=0.115,
-        b_us_per_km=76.0,
-        i_dd_a=465.0,
-    ),
-    "NA2XS(F)2Y 3x240": LineTypeSpec(
-        code="NA2XS(F)2Y 3x240",
-        description="Underground Al XLPE suburban trunk NA2XS(F)2Y 3x240 mm2",
-        r_ohm_per_km=0.072,
-        x_ohm_per_km=0.189,
-        b_us_per_km=98.0,
-        i_dd_a=518.0,
+    "NA2XS(F)2Y 1x240/25": _xlpe_cable(
+        "NA2XS(F)2Y 1x240/25", "Underground Al XLPE cable 12/20 kV, 3 x 1x240/25 in trefoil", 0.1250, 0.34, 0.29, 420.0
     ),
 }
 
@@ -161,7 +209,6 @@ class FeederSpec:
     branch_ids: tuple[int, ...]
     p_load_min_mw: float
     p_load_peak_mw: float
-    limiting_mechanism: str
 
 
 @dataclass(frozen=True)
@@ -184,7 +231,6 @@ def _make_line_branch(
     to_bus: int,
     line_type_key: str,
     length_km: float,
-    s_max_override_mva: float | None = None,
 ) -> BranchSpec:
     lt = LINE_TYPES[line_type_key]
     r_ohm = lt.r_ohm_per_km * length_km
@@ -193,7 +239,7 @@ def _make_line_branch(
     r_pu = r_ohm / Z_BASE_MV_OHM
     x_pu = x_ohm / Z_BASE_MV_OHM
     b_pu = b_s / Y_BASE_MV_S
-    s_max = s_max_override_mva if s_max_override_mva is not None else lt.s_thermal_mva
+    s_max = lt.s_thermal_mva
     i_max = float(s_max * 1000.0 / (np.sqrt(3.0) * BASE_KV_MV))
     return BranchSpec(
         branch_id=branch_id,
@@ -221,9 +267,9 @@ def build_polish_gpz_network(
     Topology:
       - Bus 0: GPZ_110kV (Slack bus, 110 kV)
       - Bus 1: GPZ_15kV (15 kV two-section busbar fed via TR1 + TR2)
-      - Buses 2..6: Feeder F1 (Rural overhead AFL-6 70 + AFL-6 50, 14.2 km, R/X ~ 0.95)
-      - Buses 7..11: Feeder F2 (Mixed cable NA2XS(F)2Y 3x150 + overhead AFL-6 70, 9.6 km)
-      - Buses 12..16: Feeder F3 (Suburban underground cable NA2XS(F)2Y 3x240, 6.4 km, R/X ~ 0.38)
+      - Buses 2..6: Feeder F1 (Rural overhead AFL-6 120 / 70 / 50, 14.2 km)
+      - Buses 7..11: Feeder F2 (Mixed cable NA2XS(F)2Y 1x150/25 + overhead AFL-6 70, 9.6 km)
+      - Buses 12..16: Feeder F3 (Suburban underground cable NA2XS(F)2Y 1x240/25, 6.4 km)
       - Buses 17..19: Feeder F4 (Industrial/municipal background load feeder, 5.1 km)
     """
     sub = SubstationSpec()
@@ -276,19 +322,19 @@ def build_polish_gpz_network(
         )
     ]
 
-    # Feeder F1: Rural long overhead (14.2 km total, R/X ~ 0.95, voltage-rise limited)
+    # Feeder F1: Rural long overhead line (14.2 km total)
     f1_segs = [
-        ("F1_N1", 2.8, "AFL-6 120", 0.25, 0.09, 0.08, 0.03, 18.5),
-        ("F1_N2", 3.0, "AFL-6 70", 0.28, 0.10, 0.09, 0.03, 18.0),
-        ("F1_N3", 3.0, "AFL-6 70", 0.30, 0.11, 0.10, 0.03, 17.5),
-        ("F1_N4", 2.8, "AFL-6 50", 0.26, 0.09, 0.09, 0.03, 17.2),
-        ("F1_PCC", 2.6, "AFL-6 50", 0.26, 0.09, 0.09, 0.03, 17.0),
+        ("F1_N1", 2.8, "AFL-6 120", 0.25, 0.09, 0.08, 0.03),
+        ("F1_N2", 3.0, "AFL-6 70", 0.28, 0.10, 0.09, 0.03),
+        ("F1_N3", 3.0, "AFL-6 70", 0.30, 0.11, 0.10, 0.03),
+        ("F1_N4", 2.8, "AFL-6 50", 0.26, 0.09, 0.09, 0.03),
+        ("F1_PCC", 2.6, "AFL-6 50", 0.26, 0.09, 0.09, 0.03),
     ]
     dist = 0.0
     prev_bus = 1
     f1_bus_ids = []
     f1_branch_ids = []
-    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn, s_lim) in enumerate(f1_segs):
+    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn) in enumerate(f1_segs):
         dist = round(dist + seg_km, 2)
         bid = len(buses)
         is_pcc = i == len(f1_segs) - 1
@@ -308,25 +354,25 @@ def build_polish_gpz_network(
         )
         brid = len(branches)
         branches.append(
-            _make_line_branch(brid, f"F1_L{i+1}", "F1", prev_bus, bid, ltype, seg_km, s_max_override_mva=s_lim)
+            _make_line_branch(brid, f"F1_L{i+1}", "F1", prev_bus, bid, ltype, seg_km)
         )
         f1_bus_ids.append(bid)
         f1_branch_ids.append(brid)
         prev_bus = bid
 
-    # Feeder F2: Mixed underground cable NA2XS(F)2Y 3x150 + overhead AFL-6 70 (9.6 km total)
+    # Feeder F2: Mixed underground cable NA2XS(F)2Y 1x150/25 + overhead AFL-6 70 (9.6 km total)
     f2_segs = [
-        ("F2_N1", 2.2, "NA2XS(F)2Y 3x150", 0.55, 0.18, 0.20, 0.06, 12.1),
-        ("F2_N2", 2.4, "NA2XS(F)2Y 3x150", 0.50, 0.17, 0.18, 0.06, 12.1),
-        ("F2_N3", 1.8, "AFL-6 70", 0.45, 0.15, 0.16, 0.05, 12.0),
-        ("F2_N4", 1.6, "AFL-6 70", 0.45, 0.15, 0.16, 0.05, 12.0),
-        ("F2_PCC", 1.6, "AFL-6 70", 0.45, 0.15, 0.15, 0.05, 11.9),
+        ("F2_N1", 2.2, "NA2XS(F)2Y 1x150/25", 0.55, 0.18, 0.20, 0.06),
+        ("F2_N2", 2.4, "NA2XS(F)2Y 1x150/25", 0.50, 0.17, 0.18, 0.06),
+        ("F2_N3", 1.8, "AFL-6 70", 0.45, 0.15, 0.16, 0.05),
+        ("F2_N4", 1.6, "AFL-6 70", 0.45, 0.15, 0.16, 0.05),
+        ("F2_PCC", 1.6, "AFL-6 70", 0.45, 0.15, 0.15, 0.05),
     ]
     dist = 0.0
     prev_bus = 1
     f2_bus_ids = []
     f2_branch_ids = []
-    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn, s_lim) in enumerate(f2_segs):
+    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn) in enumerate(f2_segs):
         dist = round(dist + seg_km, 2)
         bid = len(buses)
         is_pcc = i == len(f2_segs) - 1
@@ -346,25 +392,25 @@ def build_polish_gpz_network(
         )
         brid = len(branches)
         branches.append(
-            _make_line_branch(brid, f"F2_L{i+1}", "F2", prev_bus, bid, ltype, seg_km, s_max_override_mva=s_lim)
+            _make_line_branch(brid, f"F2_L{i+1}", "F2", prev_bus, bid, ltype, seg_km)
         )
         f2_bus_ids.append(bid)
         f2_branch_ids.append(brid)
         prev_bus = bid
 
-    # Feeder F3: Suburban underground cable NA2XS(F)2Y 3x240 (6.4 km total, R/X ~ 0.38, thermally limited)
+    # Feeder F3: Suburban underground cable NA2XS(F)2Y 1x240/25 (6.4 km total)
     f3_segs = [
-        ("F3_N1", 1.4, "NA2XS(F)2Y 3x240", 0.70, 0.23, 0.25, 0.08, 13.55),
-        ("F3_N2", 1.4, "NA2XS(F)2Y 3x240", 0.70, 0.23, 0.25, 0.08, 13.55),
-        ("F3_N3", 1.2, "NA2XS(F)2Y 3x240", 0.65, 0.21, 0.24, 0.08, 13.55),
-        ("F3_N4", 1.2, "NA2XS(F)2Y 3x240", 0.65, 0.21, 0.23, 0.07, 13.55),
-        ("F3_PCC", 1.2, "NA2XS(F)2Y 3x240", 0.60, 0.20, 0.23, 0.07, 13.55),
+        ("F3_N1", 1.4, "NA2XS(F)2Y 1x240/25", 0.70, 0.23, 0.25, 0.08),
+        ("F3_N2", 1.4, "NA2XS(F)2Y 1x240/25", 0.70, 0.23, 0.25, 0.08),
+        ("F3_N3", 1.2, "NA2XS(F)2Y 1x240/25", 0.65, 0.21, 0.24, 0.08),
+        ("F3_N4", 1.2, "NA2XS(F)2Y 1x240/25", 0.65, 0.21, 0.23, 0.07),
+        ("F3_PCC", 1.2, "NA2XS(F)2Y 1x240/25", 0.60, 0.20, 0.23, 0.07),
     ]
     dist = 0.0
     prev_bus = 1
     f3_bus_ids = []
     f3_branch_ids = []
-    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn, s_lim) in enumerate(f3_segs):
+    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn) in enumerate(f3_segs):
         dist = round(dist + seg_km, 2)
         bid = len(buses)
         is_pcc = i == len(f3_segs) - 1
@@ -384,7 +430,7 @@ def build_polish_gpz_network(
         )
         brid = len(branches)
         branches.append(
-            _make_line_branch(brid, f"F3_L{i+1}", "F3", prev_bus, bid, ltype, seg_km, s_max_override_mva=s_lim)
+            _make_line_branch(brid, f"F3_L{i+1}", "F3", prev_bus, bid, ltype, seg_km)
         )
         f3_bus_ids.append(bid)
         f3_branch_ids.append(brid)
@@ -392,15 +438,15 @@ def build_polish_gpz_network(
 
     # Feeder F4: Industrial/municipal background load feeder (5.1 km total)
     f4_segs = [
-        ("F4_N1", 1.8, "NA2XS(F)2Y 3x240", 1.60, 0.62, 0.75, 0.28, 16.0),
-        ("F4_N2", 1.7, "NA2XS(F)2Y 3x240", 1.60, 0.62, 0.75, 0.28, 16.0),
-        ("F4_N3", 1.6, "NA2XS(F)2Y 3x240", 1.60, 0.62, 0.70, 0.26, 16.0),
+        ("F4_N1", 1.8, "NA2XS(F)2Y 1x240/25", 1.60, 0.62, 0.75, 0.28),
+        ("F4_N2", 1.7, "NA2XS(F)2Y 1x240/25", 1.60, 0.62, 0.75, 0.28),
+        ("F4_N3", 1.6, "NA2XS(F)2Y 1x240/25", 1.60, 0.62, 0.70, 0.26),
     ]
     dist = 0.0
     prev_bus = 1
     f4_bus_ids = []
     f4_branch_ids = []
-    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn, s_lim) in enumerate(f4_segs):
+    for i, (bname, seg_km, ltype, p_pk, q_pk, p_mn, q_mn) in enumerate(f4_segs):
         dist = round(dist + seg_km, 2)
         bid = len(buses)
         buses.append(
@@ -419,7 +465,7 @@ def build_polish_gpz_network(
         )
         brid = len(branches)
         branches.append(
-            _make_line_branch(brid, f"F4_L{i+1}", "F4", prev_bus, bid, ltype, seg_km, s_max_override_mva=s_lim)
+            _make_line_branch(brid, f"F4_L{i+1}", "F4", prev_bus, bid, ltype, seg_km)
         )
         f4_bus_ids.append(bid)
         f4_branch_ids.append(brid)
@@ -434,54 +480,50 @@ def build_polish_gpz_network(
         "F1": FeederSpec(
             code="F1",
             name="Feeder F1 (Rural Overhead 14.2 km)",
-            description="AFL-6 70 mm2 + AFL-6 50 mm2 overhead rural line, 14.2 km, high R/X ~ 0.95",
-            total_length_km=14.2,
+            description="AFL-6 120 / 70 / 50 mm2 overhead rural line, 14.2 km",
+            total_length_km=round(sum(seg[1] for seg in f1_segs), 2),
             rx_ratio=_feeder_rx(f1_branch_ids),
             pcc_bus_id=f1_bus_ids[-1],
             bus_ids=tuple(f1_bus_ids),
             branch_ids=tuple(f1_branch_ids),
             p_load_min_mw=round(sum(buses[b].p_load_min_mw for b in f1_bus_ids), 2),
             p_load_peak_mw=round(sum(buses[b].p_load_peak_mw for b in f1_bus_ids), 2),
-            limiting_mechanism="PCC voltage rise (+5.0 %)",
         ),
         "F2": FeederSpec(
             code="F2",
             name="Feeder F2 (Mixed Cable/Overhead 9.6 km)",
-            description="NA2XS(F)2Y 3x150 mm2 underground exit + AFL-6 70 mm2 overhead, 9.6 km",
-            total_length_km=9.6,
+            description="NA2XS(F)2Y 1x150/25 underground exit + AFL-6 70 mm2 overhead, 9.6 km",
+            total_length_km=round(sum(seg[1] for seg in f2_segs), 2),
             rx_ratio=_feeder_rx(f2_branch_ids),
             pcc_bus_id=f2_bus_ids[-1],
             bus_ids=tuple(f2_bus_ids),
             branch_ids=tuple(f2_branch_ids),
             p_load_min_mw=round(sum(buses[b].p_load_min_mw for b in f2_bus_ids), 2),
             p_load_peak_mw=round(sum(buses[b].p_load_peak_mw for b in f2_bus_ids), 2),
-            limiting_mechanism="Voltage rise -> Cable thermal boundary",
         ),
         "F3": FeederSpec(
             code="F3",
             name="Feeder F3 (Suburban Cable 6.4 km)",
-            description="NA2XS(F)2Y 3x240 mm2 underground XLPE cable, 6.4 km, low R/X ~ 0.38",
-            total_length_km=6.4,
+            description="NA2XS(F)2Y 1x240/25 underground XLPE cable, 6.4 km",
+            total_length_km=round(sum(seg[1] for seg in f3_segs), 2),
             rx_ratio=_feeder_rx(f3_branch_ids),
             pcc_bus_id=f3_bus_ids[-1],
             bus_ids=tuple(f3_bus_ids),
             branch_ids=tuple(f3_branch_ids),
             p_load_min_mw=round(sum(buses[b].p_load_min_mw for b in f3_bus_ids), 2),
             p_load_peak_mw=round(sum(buses[b].p_load_peak_mw for b in f3_bus_ids), 2),
-            limiting_mechanism="Branch thermal ampacity (I <= I_dd)",
         ),
         "F4": FeederSpec(
             code="F4",
             name="Feeder F4 (Industrial Load 5.1 km)",
-            description="NA2XS(F)2Y 3x240 mm2 municipal/industrial background load feeder, 5.1 km",
-            total_length_km=5.1,
+            description="NA2XS(F)2Y 1x240/25 municipal/industrial background load feeder, 5.1 km",
+            total_length_km=round(sum(seg[1] for seg in f4_segs), 2),
             rx_ratio=_feeder_rx(f4_branch_ids),
             pcc_bus_id=f4_bus_ids[-1],
             bus_ids=tuple(f4_bus_ids),
             branch_ids=tuple(f4_branch_ids),
             p_load_min_mw=round(sum(buses[b].p_load_min_mw for b in f4_bus_ids), 2),
             p_load_peak_mw=round(sum(buses[b].p_load_peak_mw for b in f4_bus_ids), 2),
-            limiting_mechanism="Background load sink",
         ),
     }
 
