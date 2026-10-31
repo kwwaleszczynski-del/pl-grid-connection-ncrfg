@@ -244,8 +244,9 @@ function updateInteractiveSim() {
 function renderStaticChartsAndTables() {
   const H = D.headline;
   const locs = ["F1", "F2", "F3", "GPZ_N1"];
-  const sep = window.innerWidth < 640 ? "<br>" : " ";
-  const locNames = [`F1 overhead${sep}(14.2 km)`, `F2 mixed${sep}(9.6 km)`, `F3 cable${sep}(6.4 km)`, `GPZ busbar${sep}(N-1)`];
+  const narrowHc = window.innerWidth < 640;  // phone: three short lines per location, smaller ticks
+  const sep = narrowHc ? "<br>" : " ";
+  const locNames = [`F1${sep}overhead${sep}(14.2 km)`, `F2${sep}mixed${sep}(9.6 km)`, `F3${sep}cable${sep}(6.4 km)`, `GPZ${sep}busbar${sep}(N-1)`];
   const regOrder = [
     ["uncontrolled", "1. cos phi = 1.0", "#898781"],
     ["cos_phi_p", "2. cos phi(P)", "#e8a33d"],
@@ -258,6 +259,7 @@ function renderStaticChartsAndTables() {
   }));
   Plotly.react("plot-hc", hcBars, layoutBase({
     barmode: "group",
+    xaxis: axis({automargin: true, tickfont: {size: narrowHc ? 10 : 12}}),
     yaxis: axis({title: {text: "Connectable capacity [MW]"}}),
   }), cfg);
 
