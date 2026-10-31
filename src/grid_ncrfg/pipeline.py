@@ -151,14 +151,14 @@ def generate_plots(
             for loc in locs
         ]
         bars = ax1.bar(x + (i - 1) * w, vals, width=w, label=rlabel, color=col)
-        ax1.bar_label(bars, fmt="%.1f", fontsize=6.8, padding=1.5)
-    ax1.set_xticks(x, loc_labels, fontsize=8.5)
+        ax1.bar_label(bars, fmt="%.1f", fontsize=8, padding=1.5)
+    ax1.set_xticks(x, loc_labels, fontsize=9)
     ax1.set_ylabel("Connectable capacity [MW]")
     ax1.set_title("Hosting capacity by location and reactive control", fontsize=10)
     ax1.set_ylim(0, 1.15 * float(df_hc["hosting_capacity_mw"].max()))
     ax1.grid(axis="y", alpha=0.25)
     ax1.set_axisbelow(True)
-    ax1.legend(loc="upper left", fontsize=7.8, frameon=True)
+    ax1.legend(loc="upper left", fontsize=9, frameon=True)
 
     f1_sp = spatial_profiles["F1"]
     d_km = f1_sp["distances_km"]
@@ -173,7 +173,9 @@ def generate_plots(
     ax2.set_ylabel("Node voltage U / Un [pu]")
     ax2.set_title(f"Feeder F1 at {float(spatial_ref_mw):.1f} MW: voltage along the line", fontsize=10)
     ax2.grid(alpha=0.25)
-    ax2.legend(loc="upper left", fontsize=7.6, frameon=True)
+    # headroom above the 1.05 pu line for the legend; the profiles rise to the right, under it
+    ax2.set_ylim(top=max(1.10, ax2.get_ylim()[1] + 0.03))
+    ax2.legend(loc="upper left", fontsize=9, frameon=True)
     _save(fig, img_dir / "hosting_capacity.png")
 
     # 2. Sunniest May-June week time-series on Feeder F1
@@ -196,7 +198,7 @@ def generate_plots(
         fontsize=10,
     )
     ax_v.grid(alpha=0.25)
-    ax_v.legend(loc="upper right", ncol=3, fontsize=7.8, frameon=True)
+    ax_v.legend(loc="upper right", ncol=3, fontsize=9, frameon=True)
 
     ax_q.step(t_idx, m_cos["q_pcc_mvar"], where="post", lw=0.9, color=WARM, label="Q plant: cos phi(P) [Mvar]")
     ax_q.step(t_idx, m_qu["q_pcc_mvar"], where="post", lw=1.0, color=BLUE, label="Q plant: Q(U) [Mvar]")
@@ -208,7 +210,7 @@ def generate_plots(
     ax_q.set_ylim(q_min - 0.45 * (q_max - q_min), q_max + 0.1 * (q_max - q_min))
     ax_q.set_ylabel("Q [Mvar] / Loss [MW]")
     ax_q.grid(alpha=0.25)
-    ax_q.legend(loc="lower right", ncol=3, fontsize=7.8, frameon=True)
+    ax_q.legend(loc="lower right", ncol=3, fontsize=9, frameon=True)
     _save(fig, img_dir / "voltage_qu_profile.png")
 
     # 3. Export cap trade-off (50 %..100 % of P_inst)
@@ -227,7 +229,7 @@ def generate_plots(
     ax_c1.set_title("Export cap vs annual energy loss", fontsize=10)
     ax_c1.set_xlim(102, 48)
     ax_c1.grid(alpha=0.25)
-    ax_c1.legend(loc="upper left", fontsize=8, frameon=True)
+    ax_c1.legend(loc="upper left", fontsize=9, frameon=True)
 
     ax_c2.plot(caps_pct, df_curt["energy_gain_vs_firm_pct"], marker="o", ms=4.5, lw=1.4, color=GREEN,
                label="Oversized PV, capped")
@@ -242,7 +244,7 @@ def generate_plots(
     ax_c2.set_title("Annual energy through a fixed export limit", fontsize=10)
     ax_c2.set_xlim(102, 48)
     ax_c2.grid(alpha=0.25)
-    ax_c2.legend(loc="upper left", fontsize=7.6, frameon=True)
+    ax_c2.legend(loc="upper left", fontsize=9, frameon=True)
     _save(fig, img_dir / "curtailment_tradeoff.png")
 
     # 4. GPZ 110/15 kV transformer loading duration curve & seasonal heatmap under N-1
@@ -263,15 +265,16 @@ def generate_plots(
     ax_n1.set_xlim(0, hrs[-1] + 1)
     ax_n1.set_ylim(0, 1.25 * s_lim)
     ax_n1.grid(alpha=0.25)
-    ax_n1.legend(loc="upper right", fontsize=7.4, frameon=True)
+    # just below the N-1 limit line, right of the knee where all curves are low
+    ax_n1.legend(loc="upper right", bbox_to_anchor=(1.0, 0.77), fontsize=9, frameon=True)
 
     hm_arr = np.asarray(n1_study["heatmap_p95_mva"], dtype=float)
     im = ax_hm.imshow(hm_arr, aspect="auto", cmap="YlGnBu", vmin=0.0, vmax=s_lim, origin="upper")
     cbar = fig.colorbar(im, ax=ax_hm, fraction=0.046, pad=0.04)
-    cbar.set_label("P95 S [MVA]", fontsize=8.5)
-    cbar.ax.tick_params(labelsize=8)
-    ax_hm.set_yticks(np.arange(12), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], fontsize=8)
-    ax_hm.set_xticks([0, 4, 8, 12, 16, 20, 23], ["00", "04", "08", "12", "16", "20", "23"], fontsize=8)
+    cbar.set_label("P95 S [MVA]", fontsize=9)
+    cbar.ax.tick_params(labelsize=9)
+    ax_hm.set_yticks(np.arange(12), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], fontsize=9)
+    ax_hm.set_xticks([0, 4, 8, 12, 16, 20, 23], ["00", "04", "08", "12", "16", "20", "23"], fontsize=9)
     ax_hm.set_xlabel("Hour of day (Europe/Warsaw)")
     ax_hm.set_title("Scenario C: monthly P95 transformer loading [MVA]", fontsize=10)
     _save(fig, img_dir / "n1_transformer_loading.png")
@@ -410,13 +413,21 @@ const CAPS = D.spatial_capacities_mw;
 const REG = {uncontrolled: "cos phi = 1.0", cos_phi_p: "cos phi(P)", qu_droop: "Q(U) droop"};
 
 function layoutBase(extra) {
-  return Object.assign({
+  const out = Object.assign({
     paper_bgcolor: css("--surface"), plot_bgcolor: css("--surface"),
     font: {family: "system-ui, -apple-system, Segoe UI, sans-serif", color: css("--ink2"), size: 12},
     margin: {l: 56, r: 18, t: 32, b: 48},
     hoverlabel: {bgcolor: css("--surface"), font: {color: css("--ink")}},
     legend: {orientation: "h", y: 1.14, x: 0, font: {size: 11}}
   }, extra);
+  if (out.title) {
+    // title at the top of the figure, the legend in its own band between title and plot (wraps on a phone)
+    const narrow = window.innerWidth < 640;
+    out.title = Object.assign({y: 1, yref: "container", yanchor: "top", pad: {t: 6}}, out.title);
+    out.legend = Object.assign({}, out.legend, {y: 1.01, yanchor: "bottom"});
+    out.margin = Object.assign({}, out.margin, {t: narrow ? 104 : 64});
+  }
+  return out;
 }
 const axis = extra => Object.assign({gridcolor: css("--grid"), linecolor: css("--axis"), zeroline: false}, extra);
 
@@ -515,7 +526,8 @@ function updateInteractiveSim() {
 function renderStaticChartsAndTables() {
   const H = D.headline;
   const locs = ["F1", "F2", "F3", "GPZ_N1"];
-  const locNames = ["F1 overhead (14.2 km)", "F2 mixed (9.6 km)", "F3 cable (6.4 km)", "GPZ busbar (N-1)"];
+  const sep = window.innerWidth < 640 ? "<br>" : " ";
+  const locNames = [`F1 overhead${sep}(14.2 km)`, `F2 mixed${sep}(9.6 km)`, `F3 cable${sep}(6.4 km)`, `GPZ busbar${sep}(N-1)`];
   const regOrder = [
     ["uncontrolled", "1. cos phi = 1.0", "#898781"],
     ["cos_phi_p", "2. cos phi(P)", "#e8a33d"],

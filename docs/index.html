@@ -131,13 +131,21 @@ const CAPS = D.spatial_capacities_mw;
 const REG = {uncontrolled: "cos phi = 1.0", cos_phi_p: "cos phi(P)", qu_droop: "Q(U) droop"};
 
 function layoutBase(extra) {
-  return Object.assign({
+  const out = Object.assign({
     paper_bgcolor: css("--surface"), plot_bgcolor: css("--surface"),
     font: {family: "system-ui, -apple-system, Segoe UI, sans-serif", color: css("--ink2"), size: 12},
     margin: {l: 56, r: 18, t: 32, b: 48},
     hoverlabel: {bgcolor: css("--surface"), font: {color: css("--ink")}},
     legend: {orientation: "h", y: 1.14, x: 0, font: {size: 11}}
   }, extra);
+  if (out.title) {
+    // title at the top of the figure, the legend in its own band between title and plot (wraps on a phone)
+    const narrow = window.innerWidth < 640;
+    out.title = Object.assign({y: 1, yref: "container", yanchor: "top", pad: {t: 6}}, out.title);
+    out.legend = Object.assign({}, out.legend, {y: 1.01, yanchor: "bottom"});
+    out.margin = Object.assign({}, out.margin, {t: narrow ? 104 : 64});
+  }
+  return out;
 }
 const axis = extra => Object.assign({gridcolor: css("--grid"), linecolor: css("--axis"), zeroline: false}, extra);
 
@@ -236,7 +244,8 @@ function updateInteractiveSim() {
 function renderStaticChartsAndTables() {
   const H = D.headline;
   const locs = ["F1", "F2", "F3", "GPZ_N1"];
-  const locNames = ["F1 overhead (14.2 km)", "F2 mixed (9.6 km)", "F3 cable (6.4 km)", "GPZ busbar (N-1)"];
+  const sep = window.innerWidth < 640 ? "<br>" : " ";
+  const locNames = [`F1 overhead${sep}(14.2 km)`, `F2 mixed${sep}(9.6 km)`, `F3 cable${sep}(6.4 km)`, `GPZ busbar${sep}(N-1)`];
   const regOrder = [
     ["uncontrolled", "1. cos phi = 1.0", "#898781"],
     ["cos_phi_p", "2. cos phi(P)", "#e8a33d"],
