@@ -21,8 +21,9 @@ and solves it with a polar Newton-Raphson AC power flow (`Ybus`). On top of the 
    plant behind an export cap, and PV + wind + battery sharing one connection (cable pooling).
 5. **Solver verification** against the closed-form 2-bus power flow solution.
 
-Every number below is produced by `python -m grid_ncrfg run` and stored in [`results/`](results/); the network and
-the profiles are synthetic, so the results illustrate mechanisms, not a real substation or a DSO decision.
+Every number below is produced by `python -m grid_ncrfg run` and stored in [`results/`](results/); the network, the
+load and the wind profile are synthetic and PV is one PVGIS year, so the results illustrate mechanisms, not a real
+substation or a DSO decision.
 
 Interactive dashboard: https://kwwaleszczynski-del.github.io/pl-grid-connection-ncrfg/
 
@@ -64,51 +65,57 @@ existing busbar PV at full output. Capacities are rounded down to 10 kW.
 
 ### 2. Annual reactive energy and losses: $`Q(U)`$ deadband vs $`\cos\varphi(P)`$
 
-Hourly AC power flow over all 4,380 generating hours of the synthetic year for a
+Hourly AC power flow over all 4,082 generating hours of the PVGIS year for a
 2.30 MW PV plant on Feeder F1 (the unity-power-factor hosting capacity, so all three regimes are
 feasible), both GPZ transformers in service, load following the hourly load profile:
 
 | Control regime | Hours absorbing Q | Reactive energy absorbed | Extra feeder $`I^2 R`$ losses vs $`\cos\varphi = 1`$ | Highest PCC voltage |
 |---|---:|---:|---:|---:|
-| $`\cos\varphi = 1`$ | 0 h | 0.0 Mvarh | - | 1.0442 pu |
-| $`\cos\varphi(P)`$ | 808 h | 208.8 Mvarh | 3.958 MWh/yr | 1.0297 pu |
-| $`Q(U)`$, deadband $`[0.98, 1.02]\text{ pu}`$ | 448 h | 47.7 Mvarh | 0.633 MWh/yr | 1.0367 pu |
+| $`\cos\varphi = 1`$ | 0 h | 0.0 Mvarh | - | 1.0440 pu |
+| $`\cos\varphi(P)`$ | 1,103 h | 408.4 Mvarh | 9.222 MWh/yr | 1.0298 pu |
+| $`Q(U)`$, deadband $`[0.98, 1.02]\text{ pu}`$ | 785 h | 118.4 Mvarh | 1.798 MWh/yr | 1.0365 pu |
 
-- $`Q(U)`$ absorbs 77.2 % less reactive energy than $`\cos\varphi(P)`$ and causes
-  84.0 % less extra line loss, because it acts only when the PCC voltage leaves the deadband,
+- $`Q(U)`$ absorbs 71.0 % less reactive energy than $`\cos\varphi(P)`$ and causes
+  80.5 % less extra line loss, because it acts only when the PCC voltage leaves the deadband,
   whereas $`\cos\varphi(P)`$ absorbs whenever output exceeds 50 % of $`P_n`$, whatever the voltage.
-- In absolute terms the extra losses are small (3.96 MWh/yr against
-  2,997 MWh of annual PV output); the larger difference is the reactive energy the DSO network has to
+- In absolute terms the extra losses are small (9.22 MWh/yr against
+  2,878 MWh of annual PV output); the larger difference is the reactive energy the DSO network has to
   supply.
 
-![Sunny May week voltage and Q(U) profile](docs/img/voltage_qu_profile.png)
+![Sunniest May-June week voltage and Q(U) profile](docs/img/voltage_qu_profile.png)
 
-The figure shows 18-24 May (a clear week imposed in the synthetic profile) for a 3.11 MW plant on F1,
-its $`Q(U)`$ hosting capacity: the highest PCC voltage is 1.0631 pu at unity power
-factor, 1.0428 pu with $`\cos\varphi(P)`$ and 1.0466 pu with $`Q(U)`$.
+The figure shows 26 May-1 Jun (the sunniest May-June week of the PVGIS year) for a 3.11 MW plant on F1,
+its $`Q(U)`$ hosting capacity: the highest PCC voltage is 1.0618 pu at unity power
+factor, 1.0426 pu with $`\cos\varphi(P)`$ and 1.0458 pu with $`Q(U)`$.
 
 ### 3. Export caps: what the cap costs in energy
 
 A cap $`c`$ on active export lets a plant of $`P_{inst} = P_{exp} / c`$ share an export limit $`P_{exp}`$. That
 oversizing is plain arithmetic ($`1/c`$), not a power-flow result: with a 70 % cap, F1 could take
 4.44 MW of PV behind its 3.11 MW $`Q(U)`$ limit and the GPZ busbar 30.77 MW behind
-21.54 MW. What the hourly profile adds is the energy cost. PV profile: 1,303.2 MWh per MW of AC
-capacity per year (PVGIS yield, DC/AC = 1.2), peak 0.993 pu. Battery: 0.35 $`P_{inst}`$ for 2 h, 90 %
-round trip, charging only from output above the cap and discharging into headroom below it.
+21.54 MW. What the hourly profile adds is the energy cost. PV profile: PVGIS 2023 at 52.1° N, 19.4° E
+(1,043.1 kWh/kWp DC), 1,251.3 MWh per MW of AC capacity per year with DC/AC = 1.2, peak 1.000 pu (inverter limit).
+Battery: 0.35 $`P_{inst}`$ for 2 h, 90 % round trip, charging only from output above the cap and discharging into
+headroom below it.
 
 | Export cap (% of $`P_{inst}`$) | Installed MW per MW of export | Curtailed PV energy | Hours above cap | Not delivered with battery | MWh per MW of export limit | Energy gain vs firm plant | With battery |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 100 % | 1.000 | 0.00 % | 0 h | 0.00 % | 1,303.2 | +0.0 % | +0.0 % |
-| 90 % | 1.111 | 0.07 % | 25 h | 0.01 % | 1,447.0 | +11.0 % | +11.1 % |
-| 80 % | 1.250 | 0.49 % | 95 h | 0.05 % | 1,621.0 | +24.4 % | +24.9 % |
-| **70 %** | **1.429** | **1.78 %** | **238 h** | **0.39 %** | **1,828.5** | **+40.3 %** | **+42.3 %** |
-| 60 % | 1.667 | 4.43 % | 478 h | 1.71 % | 2,075.8 | +59.3 % | +63.8 % |
-| 50 % | 2.000 | 9.26 % | 808 h | 4.65 % | 2,365.1 | +81.5 % | +90.7 % |
+| 100 % | 1.000 | 0.00 % | 0 h | 0.00 % | 1,251.3 | +0.0 % | +0.0 % |
+| 90 % | 1.111 | 0.56 % | 145 h | 0.06 % | 1,382.6 | +10.5 % | +11.0 % |
+| 80 % | 1.250 | 2.51 % | 366 h | 0.28 % | 1,524.9 | +21.9 % | +24.7 % |
+| **70 %** | **1.429** | **6.53 %** | **632 h** | **1.62 %** | **1,670.9** | **+33.5 %** | **+40.5 %** |
+| 60 % | 1.667 | 12.44 % | 863 h | 5.02 % | 1,826.1 | +45.9 % | +58.3 % |
+| 50 % | 2.000 | 20.32 % | 1,103 h | 11.24 % | 1,994.1 | +59.4 % | +77.5 % |
 
-- **A 70 % cap curtails 1.78 % of the PV energy (238 h/yr) and delivers
-  40.3 % more MWh through the same export limit than a firm plant** (installed MW +42.9 %).
-  The battery cuts the energy not delivered to 0.39 % (round-trip losses included).
-- The trade-off steepens below 70 %: at 50 % the cap curtails 9.26 % of the energy.
+- **A 70 % cap curtails 6.53 % of the PV energy (632 h/yr) and delivers
+  33.5 % more MWh through the same export limit than a firm plant** (installed MW +42.9 %).
+  The battery cuts the energy not delivered to 1.62 % (round-trip losses included).
+- **The weather year matters little, the profile shape a lot.** Over the 19 PVGIS years 2005-2023 the 70 % cap
+  curtails 5.55-7.51 % of the energy (median 6.62 %,
+  [`results/export_cap_by_pv_year.csv`](results/export_cap_by_pv_year.csv)). A tilted array with DC/AC = 1.2 spends
+  many spring and summer hours near its inverter limit; an earlier synthetic profile (solar elevation times daily
+  cloudiness) had few such hours and gave 1.78 % (see Changes).
+- The trade-off steepens below 70 %: at 50 % the cap curtails 20.32 % of the energy.
 
 ![Export cap trade-off](docs/img/curtailment_tradeoff.png)
 
@@ -120,19 +127,19 @@ busbar with an export limit equal to the busbar hosting capacity (21.54 MW), exi
 
 | Scenario | New generation behind the 21.54 MW limit | Highest transformer S | Hours above 90 % of 25 MVA | Hours above 25 MVA | Energy exported | Energy not delivered |
 |---|---|---:|---:|---:|---:|---:|
-| A. Firm PV | 21.54 MW PV | 23.02 MVA | 4 h | 0 h | 28.07 GWh | 0.00 % |
-| B. Capped PV | 30.77 MW PV, cap 70 % | 23.65 MVA | 15 h | 0 h | 39.39 GWh | 1.78 % |
-| C. Cable pooling | 21.54 MW PV + 10.77 MW wind + 5.38 MW / 10.77 MWh battery | 23.52 MVA | 7 h | 0 h | 54.93 GWh | 0.12 % |
+| A. Firm PV | 21.54 MW PV | 22.97 MVA | 6 h | 0 h | 26.95 GWh | 0.00 % |
+| B. Capped PV | 30.77 MW PV, cap 70 % | 23.66 MVA | 44 h | 0 h | 35.99 GWh | 6.53 % |
+| C. Cable pooling | 21.54 MW PV + 10.77 MW wind + 5.38 MW / 10.77 MWh battery | 23.47 MVA | 29 h | 0 h | 53.59 GWh | 0.53 % |
 
 - No scenario overloads the remaining transformer in any hour: the export limit was sized for minimum load with all
-  PV at rated output, and the synthetic year never combines the two (PV peaks at 0.993 pu and midday
-  load stays above its minimum).
-- **The same 21.54 MW connection carries 1.96 times the energy
-  of the firm PV plant when wind is pooled behind it** (54.93 vs 28.07 GWh/yr).
-  Because the synthetic wind and PV rarely peak together, only 0.29 % of the pooled energy
-  would be spilled without the battery and 0.12 % with it (conversion losses included).
-- The capped plant (B) pushes the transformer close to its limit more often (15 h above 90 % vs
-  4 h for A) while exporting 40.3 % more energy.
+  PV at rated output, and in the PVGIS year the hours with PV at its inverter limit never coincide with minimum
+  load (midday load stays above its minimum).
+- **The same 21.54 MW connection carries 1.99 times the energy
+  of the firm PV plant when wind is pooled behind it** (53.59 vs 26.95 GWh/yr).
+  Because the synthetic wind and PV rarely peak together, only 1.29 % of the pooled energy
+  would be spilled without the battery and 0.53 % with it (conversion losses included).
+- The capped plant (B) pushes the transformer close to its limit more often (44 h above 90 % vs
+  6 h for A) while exporting 33.5 % more energy.
 
 ![GPZ N-1 transformer loading duration curve and seasonal heatmap](docs/img/n1_transformer_loading.png)
 
@@ -237,10 +244,15 @@ Q(U) =
 ```
 
 with $`Q_{\max}`$ reduced proportionally when available power is below $`0.1\,P_n`$. These parameters, the
-$`1.05\text{ pu}`$ planning limit and the 50 % knee are study assumptions. The applicable settings come from
-Commission Regulation (EU) 2016/631 (NC RfG, Art. 21(3)(d) for power park modules), the Polish requirements of
-general application adopted under it, the DSO grid code (IRiESD) and the connection conditions of each plant; they
-change over time and must be verified for any real case.
+$`1.05\text{ pu}`$ planning limit and the 50 % knee are study assumptions. Which article of Commission Regulation
+(EU) 2016/631 (NC RfG) applies depends on the plant type. In Poland a power park module connected below 110 kV is
+type B from 0.2 MW and type C from 10 MW (type D from 75 MW or at 110 kV and above; thresholds set by URE in 2018,
+to be verified). The feeder plants on F1 and F2 (2.30-6.31 MW, also 4.44 MW behind a 70 % cap) are type B:
+Art. 20(2)(a) lets the system operator specify their reactive power capability. The F3 plant (10.77-11.41 MW) and the
+GPZ busbar plants (19.59-30.77 MW) are type C: Art. 21(3)(b)-(d) add the reactive power capability profiles and the
+voltage, reactive power and power factor control modes. The settings themselves come from the Polish requirements of
+general application adopted under the regulation, the DSO grid code (IRiESD) and the connection conditions of each
+plant; they change over time and must be verified for any real case.
 
 ### Hosting capacity, battery and profiles
 
@@ -249,16 +261,19 @@ change over time and must be verified for any real case.
   $`\le 25\text{ MVA}`$). The binding constraint is the one violated just above the reported value.
 - Battery: hourly dispatch behind a shared export limit; charge from output above the limit, discharge into headroom
   below it, power, energy and $`\sqrt{0.9}`$ charge/discharge efficiency limits (`dispatch_export_limited_bess`).
-- Profiles (`src/grid_ncrfg/profiles.py`), synthetic and seeded: PV from solar geometry at 52.1° N, 19.4° E with
-  day-correlated random cloudiness, scaled to the PVGIS-SARAH3 yield of 1,086 kWh/kWp (fixed array, optimal 40° tilt,
-  14 % losses) and converted to AC with DC/AC = 1.2; wind from an AR(1) Weibull wind speed and a generic 3-12-25 m/s
+- Profiles (`src/grid_ncrfg/profiles.py`): PV is the hourly PVGIS 5.3 output (PVGIS-SARAH3 radiation, ERA5
+  temperature) at 52.1° N, 19.4° E for a fixed south-facing c-Si array at the PVGIS optimal 40° tilt with 14 % losses,
+  2005-2023 (stored in `src/grid_ncrfg/data/`); the study year is 2023, the most recent complete year, laid on the
+  2026 calendar and converted to AC with DC/AC = 1.2. Synthetic and seeded: wind from an AR(1) Weibull wind speed and a generic 3-12-25 m/s
   power curve scaled to 2,500 full-load hours (assumed, of the order of the Polish onshore fleet; to be
   verified); load from a seasonal and daily shape between 33 % and 100 % of peak.
 
 ## Limitations
 
-- **Synthetic network and profiles.** Feeder lengths, loads, the existing 8 MW of busbar PV
-  and all profiles are assumptions; only conductor data and the PV yield come from external sources.
+- **Synthetic network, load and wind.** Feeder lengths, loads, the existing 8 MW of busbar PV
+  and the load and wind profiles are assumptions; only conductor data and the PV series come from external sources.
+  The PV series is one site and one array orientation; east-west or tracking arrays reach the inverter limit in
+  fewer hours.
 - **Balanced positive-sequence steady state.** Unbalance, earth faults (Petersen coil compensation typical of Polish
   15 kV networks), harmonics and dynamics are not modelled.
 - **No short-circuit or protection study.** Real connection studies also check fault levels against switchgear
@@ -269,6 +284,13 @@ change over time and must be verified for any real case.
 - **Cable pooling and export caps.** The legal framework (cable pooling was added to the Polish Energy Law,
   *Prawo energetyczne*, in 2023; conditions of non-firm connection agreements) is not modelled and should be checked
   in the current law and DSO practice. The battery policy minimises spilled energy only; it does not trade.
+
+## Data
+
+| Data | Source | Terms |
+|---|---|---|
+| Hourly PV output 2005-2023, 52.1° N 19.4° E | [PVGIS 5.3](https://re.jrc.ec.europa.eu/pvg_tools/en/), European Commission, Joint Research Centre (PVGIS-SARAH3 radiation, ERA5 temperature) | © European Union; reuse with acknowledgement of the source (Commission Decision 2011/833/EU) |
+| Conductor data | Tele-Fonika Kable, Eltrim Kable, NKT data sheets | catalogue values, see Network data |
 
 ## Reproduce
 
@@ -295,5 +317,13 @@ tests/           pytest suite (invariants and output consistency)
 results/         CSV and JSON study outputs
 docs/            GitHub Pages dashboard and figures
 ```
+
+## Changes
+
+- 2026-10-31: the PV profile is now the hourly PVGIS series instead of a synthetic one (solar elevation times
+  random daily cloudiness, scaled to the PVGIS annual yield). The synthetic shape had too few hours near the
+  inverter limit: a 70 % export cap curtailed 1.78 % of the energy (238 h) with it, against 6.53 % (632 h) with
+  PVGIS 2023. The reactive-energy, export-cap and `N-1` results changed accordingly; the hosting capacities do not
+  depend on the profile. The NC RfG reference now distinguishes type B (Art. 20) and type C (Art. 21) plants.
 
 MIT licence.

@@ -69,7 +69,7 @@ energy. Every number on this page is read from the pipeline output. Code and met
 <h2>1. Feeder connection simulator</h2>
 <p>Select a 15 kV feeder, a reactive control regime and a candidate PV capacity. The left chart is the Newton-Raphson
 AC voltage profile along the feeder at minimum load against the 1.05 pu limit (GPZ busbar held at 1.00 pu by the
-OLTC). The right chart is the hourly power flow of the sunny May week on Feeder F1 for the plant size stated in its
+OLTC). The right chart is the hourly power flow of the sunniest May-June week on Feeder F1 for the plant size stated in its
 title (it does not change with the slider).</p>
 
 <div class="card">
@@ -115,7 +115,7 @@ ampacity, at minimum load and full plant output. The GPZ row is new generation a
 solution and nodal power conservation.</p>
 <div class="card scroll"><table id="tbl-ver"></table></div>
 
-<p class="note" style="margin-top: 28px;">Synthetic network and profiles; not a real substation or a DSO assessment.
+<p class="note" style="margin-top: 28px;">Synthetic network, load and wind; PV from PVGIS. Not a real substation or a DSO assessment.
 Control modes follow NC RfG (Commission Regulation (EU) 2016/631) and EN 50549-2 families; the parameter values and
 the 1.05 pu limit are study assumptions to be verified against the current Polish requirements of general
 application and the DSO IRiESD. Code: MIT licence.</p>
@@ -224,7 +224,7 @@ function updateInteractiveSim() {
      name: "Q plant [Mvar] (right)", yaxis: "y2", line: {color: css("--s2"), width: 1.5, dash: "dot", shape: "hv"}},
   ];
   Plotly.react("plot-week", tracesWk, layoutBase({
-    title: {text: `F1, ${fmt(W.p_inst_mw, 2)} MW PV, 18-24 May: ${REG[rcode]}`, font: {size: 13}},
+    title: {text: `F1, ${fmt(W.p_inst_mw, 2)} MW PV, ${W.label}: ${REG[rcode]}`, font: {size: 13}},
     xaxis: axis({type: "date"}),
     yaxis: axis({title: {text: "PCC voltage [pu]"}}),
     yaxis2: axis({overlaying: "y", side: "right", showgrid: false, title: {text: "Q [Mvar]"}}),
@@ -260,7 +260,8 @@ function renderStaticChartsAndTables() {
   const N1 = D.n1_study;
   document.getElementById("txt-curt").textContent =
     `A ${H.highlight_cap_pct} % export cap lets ${fmt(1 / (H.highlight_cap_pct / 100), 2)} MW of PV share 1 MW of export limit (arithmetic); ` +
-    `over the synthetic year it curtails ${fmt(H.curt_hl_pct, 2)} % of that PV energy and delivers ` +
+    `over the PVGIS ${H.pv_year} year it curtails ${fmt(H.curt_hl_pct, 2)} % of that PV energy ` +
+    `(${fmt(H.curt_hl_min_pct, 2)}-${fmt(H.curt_hl_max_pct, 2)} % over the PVGIS years 2005-2023) and delivers ` +
     `${fmt(H.energy_gain_hl_pct, 1)} % more MWh through the same limit than a firm plant. ` +
     `Right: hourly N-1 power flow of the GPZ for the firm, capped and pooled (PV + wind + battery) busbar scenarios; ` +
     `highest transformer loading ${fmt(N1.max_s_firm_pv_mva, 2)} / ${fmt(N1.max_s_capped_pv_mva, 2)} / ${fmt(N1.max_s_pooling_bess_mva, 2)} MVA ` +

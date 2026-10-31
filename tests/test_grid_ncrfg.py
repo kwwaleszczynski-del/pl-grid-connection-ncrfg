@@ -31,7 +31,7 @@ from grid_ncrfg.ncrfg import (
     qu_droop_q_and_slope,
     solve_feeder_with_ncrfg,
 )
-from grid_ncrfg.profiles import PV_DC_AC_RATIO, PV_YIELD_KWH_PER_KWP, WIND_FLH, generate_annual_polish_profiles
+from grid_ncrfg.profiles import PV_DC_AC_RATIO, PV_YEAR, WIND_FLH, generate_annual_polish_profiles, pv_dc_year
 from grid_ncrfg.hosting import (
     compute_annual_reactive_loss_comparison,
     compute_curtailment_tradeoff,
@@ -386,8 +386,11 @@ def test_annual_profiles_match_calibration(profiles):
     """Profiles must hit their calibration totals and stay within physical bounds."""
     assert len(profiles) == 8760
     assert profiles["wind_cf"].sum() == pytest.approx(WIND_FLH, rel=1e-6)
+    dc_yield = pv_dc_year(PV_YEAR).sum()
+    assert 900.0 < dc_yield < 1250.0  # kWh/kWp, central Poland
     pv_sum = profiles["pv_cf"].sum()
-    assert PV_YIELD_KWH_PER_KWP < pv_sum <= PV_DC_AC_RATIO * PV_YIELD_KWH_PER_KWP + 1e-6
+    assert dc_yield < pv_sum <= PV_DC_AC_RATIO * dc_yield + 1e-6
+    assert np.allclose(profiles["pv_cf"], np.minimum(PV_DC_AC_RATIO * pv_dc_year(PV_YEAR), 1.0))
     for col in ["pv_cf", "wind_cf", "load_scale"]:
         assert profiles[col].min() >= 0.0 and profiles[col].max() <= 1.0 + 1e-12
     summer_pv = profiles.loc[profiles["month"].isin([5, 6, 7]), "pv_cf"].mean()

@@ -13,12 +13,13 @@ import matplotlib.pyplot as plt
 from .network import LINE_TYPES, Z_BASE_MV_OHM, NetworkModel, build_polish_gpz_network
 from .powerflow import verify_two_bus_analytical
 from .ncrfg import CONTROL_REGIMES, solve_feeder_with_ncrfg
-from .profiles import generate_annual_polish_profiles
+from .profiles import PV_YEAR, generate_annual_polish_profiles, pv_dc_year
 from .hosting import (
     GPZ_EXISTING_GEN_MW,
     compute_hosting_capacity_table,
     compute_annual_reactive_loss_comparison,
     compute_curtailment_tradeoff,
+    compute_export_cap_by_pv_year,
     compute_n1_transformer_study,
     simulate_sunny_week_trace,
 )
@@ -175,7 +176,7 @@ def generate_plots(
     ax2.legend(loc="upper left", fontsize=7.6, frameon=True)
     _save(fig, img_dir / "hosting_capacity.png")
 
-    # 2. Sunny May week time-series on Feeder F1
+    # 2. Sunniest May-June week time-series on Feeder F1
     fig, (ax_v, ax_q) = plt.subplots(2, 1, figsize=(10.0, 5.2), sharex=True)
     t_idx = pd.to_datetime(week_trace["timestamps"])
     m_unc = week_trace["modes"]["uncontrolled"]
@@ -191,7 +192,7 @@ def generate_plots(
     ax_v.set_ylim(min(0.975, float(v_all.min()) - 0.005), max(1.055, float(v_all.max())) + 0.03)
     ax_v.set_ylabel("PCC voltage [pu]")
     ax_v.set_title(
-        f"Feeder F1 ({week_trace['p_inst_mw']:.2f} MW PV), 18-24 May: PCC voltage and plant reactive power",
+        f"Feeder F1 ({week_trace['p_inst_mw']:.2f} MW PV), {week_trace['label']}: PCC voltage and plant reactive power",
         fontsize=10,
     )
     ax_v.grid(alpha=0.25)
@@ -347,7 +348,7 @@ energy. Every number on this page is read from the pipeline output. Code and met
 <h2>1. Feeder connection simulator</h2>
 <p>Select a 15 kV feeder, a reactive control regime and a candidate PV capacity. The left chart is the Newton-Raphson
 AC voltage profile along the feeder at minimum load against the 1.05 pu limit (GPZ busbar held at 1.00 pu by the
-OLTC). The right chart is the hourly power flow of the sunny May week on Feeder F1 for the plant size stated in its
+OLTC). The right chart is the hourly power flow of the sunniest May-June week on Feeder F1 for the plant size stated in its
 title (it does not change with the slider).</p>
 
 <div class="card">
@@ -393,7 +394,7 @@ ampacity, at minimum load and full plant output. The GPZ row is new generation a
 solution and nodal power conservation.</p>
 <div class="card scroll"><table id="tbl-ver"></table></div>
 
-<p class="note" style="margin-top: 28px;">Synthetic network and profiles; not a real substation or a DSO assessment.
+<p class="note" style="margin-top: 28px;">Synthetic network, load and wind; PV from PVGIS. Not a real substation or a DSO assessment.
 Control modes follow NC RfG (Commission Regulation (EU) 2016/631) and EN 50549-2 families; the parameter values and
 the 1.05 pu limit are study assumptions to be verified against the current Polish requirements of general
 application and the DSO IRiESD. Code: MIT licence.</p>
@@ -502,7 +503,7 @@ function updateInteractiveSim() {
      name: "Q plant [Mvar] (right)", yaxis: "y2", line: {color: css("--s2"), width: 1.5, dash: "dot", shape: "hv"}},
   ];
   Plotly.react("plot-week", tracesWk, layoutBase({
-    title: {text: `F1, ${fmt(W.p_inst_mw, 2)} MW PV, 18-24 May: ${REG[rcode]}`, font: {size: 13}},
+    title: {text: `F1, ${fmt(W.p_inst_mw, 2)} MW PV, ${W.label}: ${REG[rcode]}`, font: {size: 13}},
     xaxis: axis({type: "date"}),
     yaxis: axis({title: {text: "PCC voltage [pu]"}}),
     yaxis2: axis({overlaying: "y", side: "right", showgrid: false, title: {text: "Q [Mvar]"}}),
@@ -538,7 +539,8 @@ function renderStaticChartsAndTables() {
   const N1 = D.n1_study;
   document.getElementById("txt-curt").textContent =
     `A ${H.highlight_cap_pct} % export cap lets ${fmt(1 / (H.highlight_cap_pct / 100), 2)} MW of PV share 1 MW of export limit (arithmetic); ` +
-    `over the synthetic year it curtails ${fmt(H.curt_hl_pct, 2)} % of that PV energy and delivers ` +
+    `over the PVGIS ${H.pv_year} year it curtails ${fmt(H.curt_hl_pct, 2)} % of that PV energy ` +
+    `(${fmt(H.curt_hl_min_pct, 2)}-${fmt(H.curt_hl_max_pct, 2)} % over the PVGIS years 2005-2023) and delivers ` +
     `${fmt(H.energy_gain_hl_pct, 1)} % more MWh through the same limit than a firm plant. ` +
     `Right: hourly N-1 power flow of the GPZ for the firm, capped and pooled (PV + wind + battery) busbar scenarios; ` +
     `highest transformer loading ${fmt(N1.max_s_firm_pv_mva, 2)} / ${fmt(N1.max_s_capped_pv_mva, 2)} / ${fmt(N1.max_s_pooling_bess_mva, 2)} MVA ` +
@@ -639,6 +641,8 @@ def run_full_pipeline(output_root: Path | None = None) -> dict:
 
     df_curt = compute_curtailment_tradeoff(df_profiles)
     df_curt.to_csv(results_dir / "curtailment_tradeoff.csv", index=False)
+    df_cap_years = compute_export_cap_by_pv_year(HIGHLIGHT_CAP_PCT)
+    df_cap_years.to_csv(results_dir / "export_cap_by_pv_year.csv", index=False)
 
     # Reactive study plant: the F1 unity-power-factor hosting capacity, feasible under all three regimes
     loss_cmp = compute_annual_reactive_loss_comparison(
@@ -681,6 +685,12 @@ def run_full_pipeline(output_root: Path | None = None) -> dict:
         "curt_hl_hours": int(row_hl["curtailed_hours_per_yr"]),
         "energy_gain_hl_pct": float(row_hl["energy_gain_vs_firm_pct"]),
         "bess_lost_hl_pct": float(row_hl["bess_lost_energy_pct"]),
+        "curt_hl_min_pct": float(df_cap_years["curtailed_energy_pct"].min()),
+        "curt_hl_median_pct": float(df_cap_years["curtailed_energy_pct"].median()),
+        "curt_hl_max_pct": float(df_cap_years["curtailed_energy_pct"].max()),
+        "pv_year": PV_YEAR,
+        "pv_dc_yield": round(float(pv_dc_year(PV_YEAR).sum()), 1),
+        "pv_dc_yield_mean": round(float(df_cap_years["dc_yield_kwh_per_kwp"].mean()), 1),
         "pooling_spilled_nobess_pct": n1_study["pooling_spilled_nobess_pct"],
         "pooling_lost_bess_pct": n1_study["pooling_lost_bess_pct"],
         "pv_flh": round(float(df_profiles["pv_cf"].sum()), 1),
@@ -694,6 +704,7 @@ def run_full_pipeline(output_root: Path | None = None) -> dict:
         "network": describe_network(net_n1),
         "hosting_table": df_hc.to_dict(orient="records"),
         "curtailment": df_curt.to_dict(orient="records"),
+        "export_cap_by_pv_year": df_cap_years.to_dict(orient="records"),
         "reactive_loss_comparison": loss_cmp,
         "n1_study": n1_study,
         "week_trace": week_trace,

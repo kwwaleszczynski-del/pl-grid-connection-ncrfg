@@ -14,7 +14,7 @@ from .ncrfg import (
     solve_feeder_with_ncrfg,
 )
 from .powerflow import PowerFlowResult, solve_ac_powerflow
-from .profiles import generate_annual_polish_profiles
+from .profiles import PV_DC_AC_RATIO, generate_annual_polish_profiles, load_pvgis_hourly, pv_dc_year
 
 
 V_MAX_PU: float = 1.050
@@ -305,6 +305,27 @@ def compute_curtailment_tradeoff(
     return pd.DataFrame(rows)
 
 
+def compute_export_cap_by_pv_year(cap_pct: int = 70) -> pd.DataFrame:
+    """The export-cap trade-off at ``cap_pct`` for every PVGIS year 2005-2023 (sensitivity to the weather year)."""
+    rows = []
+    for pv_year in sorted(set(load_pvgis_hourly().index.year)):
+        dc = pv_dc_year(pv_year)
+        pv_cf = np.minimum(PV_DC_AC_RATIO * dc, 1.0)
+        row = compute_curtailment_tradeoff(pd.DataFrame({"pv_cf": pv_cf}))
+        row = row[row["export_cap_pct"] == cap_pct].iloc[0]
+        rows.append({
+            "pv_year": pv_year,
+            "dc_yield_kwh_per_kwp": round(float(dc.sum()), 1),
+            "ac_full_load_hours": round(float(pv_cf.sum()), 1),
+            "export_cap_pct": cap_pct,
+            "curtailed_energy_pct": float(row["curtailed_energy_pct"]),
+            "curtailed_hours_per_yr": int(row["curtailed_hours_per_yr"]),
+            "bess_lost_energy_pct": float(row["bess_lost_energy_pct"]),
+            "energy_gain_vs_firm_pct": float(row["energy_gain_vs_firm_pct"]),
+        })
+    return pd.DataFrame(rows)
+
+
 def compute_n1_transformer_study(
     net_n1: NetworkModel | None = None,
     df_profiles: pd.DataFrame | None = None,
@@ -390,24 +411,36 @@ def compute_n1_transformer_study(
     return out
 
 
+def sunniest_week_start(df_profiles: pd.DataFrame, months: tuple[int, ...] = (5, 6)) -> pd.Timestamp:
+    """Local midnight starting the 7 consecutive days within ``months`` with the most PV energy."""
+    ts_pl = df_profiles["ts_local"]
+    day = ts_pl.dt.normalize()
+    daily = df_profiles["pv_cf"].groupby(day.to_numpy()).sum()
+    daily = daily[daily.index.month.isin(months)]
+    week = daily.rolling(7).sum().shift(-6).dropna()
+    week = week[(week.index + pd.Timedelta(days=6)).month.isin(months)]
+    return week.idxmax()
+
+
 def simulate_sunny_week_trace(
     net: NetworkModel | None = None,
     df_profiles: pd.DataFrame | None = None,
     feeder_code: str = "F1",
     p_inst_mw: float = 3.0,
 ) -> dict:
-    """Simulate a 7-day sunny May week (168 hours, 18-24 May) on a feeder across the control regimes."""
+    """Simulate the sunniest May-June week of the profile (168 hours) on a feeder across the control regimes."""
     net = net or build_polish_gpz_network(n_transformers=2)
     df = df_profiles if df_profiles is not None else generate_annual_polish_profiles()
     fspec = net.feeders[feeder_code]
     br_ids = list(fspec.branch_ids)
-    year = int(df["ts_local"].iloc[0].year)
 
     ts_pl = df["ts_local"]
-    mask = (ts_pl >= pd.Timestamp(f"{year}-05-18 00:00:00", tz="Europe/Warsaw")) & (
-        ts_pl < pd.Timestamp(f"{year}-05-25 00:00:00", tz="Europe/Warsaw")
-    )
+    start = sunniest_week_start(df)
+    mask = (ts_pl >= start) & (ts_pl < start + pd.Timedelta(days=7))
     sub = df.loc[mask]
+    last = start + pd.Timedelta(days=6)
+    label = (f"{start.day}-{last.day} {last:%b}" if start.month == last.month
+             else f"{start.day} {start:%b}-{last.day} {last:%b}")
 
     timestamps = [t.strftime("%Y-%m-%d %H:%M") for t in sub["ts_local"]]
     pv_cf = sub["pv_cf"].to_numpy()
@@ -434,6 +467,7 @@ def simulate_sunny_week_trace(
 
     return {
         "timestamps": timestamps,
+        "label": label,
         "feeder": feeder_code,
         "p_inst_mw": p_inst_mw,
         "pv_avail_mw": [round(float(p_inst_mw * x), 3) for x in pv_cf],
